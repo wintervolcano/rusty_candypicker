@@ -1,0 +1,14 @@
+[package]
+name = "candy_picker_rs"
+version = "0.3.0"
+edition = "2021"
+authors = ["Fazal Kareem <fkareem@mpifr-bonn.mpg.de>"]
+description = "Rust candidate picker for peasoup XML files, this is essentially a fork of candy_picker by vivek."
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+rayon = "1.11"
+xmltree = "0.10"
+csv = "1.3"

@@ -1,0 +1,14 @@
+# Rust build
+/target/
+**/*.rs.bk
+
+# Cargo
+Cargo.lock
+
+# Apptainer/Singularity images
+*.sif
+
+# Editor junk
+*.swp
+*.swo
+.DS_Store

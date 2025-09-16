@@ -1,0 +1,38 @@
+Bootstrap: docker
+From: rust:1.81-slim
+
+%labels
+    Author Fazal Kareem
+    Version v0.3.0
+
+%environment
+    CARGO_TERM_COLOR=always
+    PATH=/usr/local/cargo/bin:$PATH
+    export PATH
+
+%post
+    apt-get update && apt-get install -y --no-install-recommends \
+        pkg-config \
+        libssl-dev \
+        build-essential \
+        git \
+        ca-certificates \
+        && rm -rf /var/lib/apt/lists/*
+
+    # Create app directory
+    mkdir -p /opt/candy_picker_rs
+
+    # Copy project into container
+    cp -r /candy_picker_src/* /opt/candy_picker_rs/
+
+    cd /opt/candy_picker_rs
+    cargo build --release
+
+    # Install binary into PATH
+    cp target/release/candy_picker_rs /usr/local/bin/
+
+%files
+    . /candy_picker_src
+
+%runscript
+    exec candy_picker_rs "$@"
