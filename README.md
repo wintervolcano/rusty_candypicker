@@ -25,8 +25,9 @@ Clone the repository:
 ```bash
 git clone https://github.com/yourusername/candy_picker_rs.git
 cd candy_picker_rs
+```
 
-Build in release mode:
+### Build in release mode:
 
 ```bash
 cargo build --release
@@ -37,8 +38,7 @@ The binary will be available at:
 target/release/candy_picker_rs
 ```
 
----
-Singularity/Apptainer
+### Singularity/Apptainer
 
 A definition file is included for containerized builds. To build the image:
 ```bash
@@ -54,7 +54,7 @@ singularity exec candy_picker_rs.sif candy_picker_rs -h
 Basic Usage:
 ```bash
 candy_picker_rs [OPTIONS] -p <period_thresh> <xml_files>...
-```
+
 Options:
   -p <period_thresh>      default: 1e-6
   -d <dm_thresh>          
@@ -62,6 +62,7 @@ Options:
   --bin-dm                optional to cluster candidates within dm_thresh
   -h, --help              Print help
   -V, --version           Print version
+```
 
 Example:
 ```bash
