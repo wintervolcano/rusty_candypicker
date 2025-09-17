@@ -289,42 +289,87 @@ fn save_candidates_csv(cands: &[Candidate], pivots: &[usize], filename: &str) ->
     Ok(())
 }
 
-fn write_updated_xmls(xf: &XmlFile, _cands: &[Candidate], pivot_map: &HashMap<(String,i32), bool>) -> Result<()> {
+fn strip_xml_decl(s: &str) -> &str {
+    // Remove any UTF-8 BOM and leading whitespace
+    let trimmed = s.trim_start_matches(|c: char| c == '\u{feff}' || c.is_whitespace());    // If it starts with an XML declaration, skip it
+    if trimmed.starts_with("<?xml") {
+        // find the end of declaration "?>"
+        if let Some(pos) = trimmed.find("?>") {
+            return trimmed[(pos + 2)..].trim_start();
+        }
+    }
+    trimmed
+}
+
+fn write_updated_xmls(
+    xf: &XmlFile,
+    _cands: &[Candidate],
+    pivot_map: &HashMap<(String, i32), bool>,
+) -> Result<()> {
+    use std::io::BufRead;
+
+    // --- Preserve the original XML declaration from the first line ---
+    let file = fs::File::open(&xf.filename)?;
+    let mut first_line = String::new();
+    {
+        let mut reader = std::io::BufReader::new(&file);
+        reader.read_line(&mut first_line)?;
+    }
+    let xml_decl = if first_line.trim_start().starts_with("<?xml") {
+        first_line.trim().to_string()
+    } else {
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>".to_string()
+    };
+
     let picked_name = xf.filename.replace(".xml", "_picked.xml");
     let rejected_name = xf.filename.replace(".xml", "_rejected.xml");
+
     let mut base = String::new();
-    base.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<peasoup_search>\n");
-    if let Some(s) = &xf.sections.misc_info { base.push_str(s); base.push('\n'); }
-    if let Some(s) = &xf.sections.header_parameters { base.push_str(s); base.push('\n'); }
-    if let Some(s) = &xf.sections.search_parameters { base.push_str(s); base.push('\n'); }
-    if let Some(s) = &xf.sections.segment_parameters { base.push_str(s); base.push('\n'); }
-    if let Some(s) = &xf.sections.dedispersion_trials { base.push_str(s); base.push('\n'); }
-    if let Some(s) = &xf.sections.acceleration_trials { base.push_str(s); base.push('\n'); }
-    if let Some(s) = &xf.sections.cuda_device_parameters { base.push_str(s); base.push('\n'); }
+    base.push_str(&xml_decl);
+    base.push('\n');
+    base.push_str("<peasoup_search>\n");
+
+    if let Some(s) = &xf.sections.misc_info { base.push_str(strip_xml_decl(s)); base.push('\n'); }
+    if let Some(s) = &xf.sections.header_parameters { base.push_str(strip_xml_decl(s)); base.push('\n'); }
+    if let Some(s) = &xf.sections.search_parameters { base.push_str(strip_xml_decl(s)); base.push('\n'); }
+    if let Some(s) = &xf.sections.segment_parameters { base.push_str(strip_xml_decl(s)); base.push('\n'); }
+    if let Some(s) = &xf.sections.dedispersion_trials { base.push_str(strip_xml_decl(s)); base.push('\n'); }
+    if let Some(s) = &xf.sections.acceleration_trials { base.push_str(strip_xml_decl(s)); base.push('\n'); }
+    if let Some(s) = &xf.sections.cuda_device_parameters { base.push_str(strip_xml_decl(s)); base.push('\n'); }
 
     let mut picked = base.clone();
     let mut rejected = base.clone();
     picked.push_str("<candidates>\n");
     rejected.push_str("<candidates>\n");
+
     for c in &xf.candidates {
         let is_pivot = *pivot_map.get(&(c.xml_file.clone(), c.candidate_id)).unwrap_or(&false);
         if is_pivot {
-            picked.push_str(&c.raw_xml); picked.push('\n');
+            picked.push_str(strip_xml_decl(&c.raw_xml));
+            picked.push('\n');
         } else {
-            rejected.push_str(&c.raw_xml); rejected.push('\n');
+            rejected.push_str(strip_xml_decl(&c.raw_xml));
+            rejected.push('\n');
         }
     }
+
     picked.push_str("</candidates>\n");
     rejected.push_str("</candidates>\n");
+
     if let Some(s) = &xf.sections.execution_times {
-        picked.push_str(s); picked.push('\n');
-        rejected.push_str(s); rejected.push('\n');
+        picked.push_str(strip_xml_decl(s));
+        picked.push('\n');
+        rejected.push_str(strip_xml_decl(s));
+        rejected.push('\n');
     }
+
     picked.push_str("</peasoup_search>\n");
     rejected.push_str("</peasoup_search>\n");
+
     fs::write(&picked_name, picked)?;
     fs::write(&rejected_name, rejected)?;
     println!("[INFO] Wrote {picked_name} and {rejected_name}");
+
     Ok(())
 }
 
