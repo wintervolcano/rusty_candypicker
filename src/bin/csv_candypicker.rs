@@ -1,13 +1,28 @@
 use anyhow::Result;
-use clap::{Arg, Command};
-use candy_picker_rs::csv_cluster::cluster_csv;
+use clap::{Arg, ArgAction, Command};
+use candy_picker_rs::csv_cluster::{cluster_csv, cluster_csv_multi};
 
 fn main() -> Result<()> {
     let matches = Command::new("csv_candypicker")
         .version("0.3.0")
-        .about("Cluster fold candidates in CSV by absolute |ΔP| with optional DM/ACC gates and harmonics.")
-        .arg(Arg::new("input").short('i').long("input").num_args(1).required(true))
-        .arg(Arg::new("output").short('o').long("output").num_args(1).required(true))
+        .about("Cluster fold candidates in CSV(s) by absolute |ΔP| with optional DM/ACC gates and harmonics. Writes full rows for picked pivots.")
+        .arg(
+            Arg::new("input")
+                .short('i')
+                .long("input")
+                .num_args(1..)
+                .action(ArgAction::Append)
+                .required(true)
+                .help("One or more input CSV files"),
+        )
+        .arg(
+            Arg::new("output")
+                .short('o')
+                .long("output")
+                .num_args(1)
+                .required(true)
+                .help("Output picked CSV"),
+        )
         .arg(
             Arg::new("ptol")
                 .long("ptol")
@@ -32,41 +47,58 @@ fn main() -> Result<()> {
         .arg(
             Arg::new("no_harmonics")
                 .long("no-harmonics")
-                .action(clap::ArgAction::SetTrue)
-                .help("Disable harmonic catch (modulo-style). Default is ON (enabled)."),
+                .action(ArgAction::SetTrue)
+                .help("Disable harmonic catch (modulo). Default is enabled."),
         )
         .arg(
             Arg::new("tobs")
                 .long("tobs")
                 .num_args(1)
                 .required(false)
-                .help("Observation length in seconds (used for acceleration period correction). Default 600."),
+                .help("Observation length in seconds (for acceleration correction). Default 3600."),
+        )
+        .arg(
+            Arg::new("source_col")
+                .long("source-col")
+                .num_args(1)
+                .required(false)
+                .help("Optional: add a column with this name containing the source filename"),
         )
         .get_matches();
 
-    let input = matches.get_one::<String>("input").unwrap();
+    let inputs: Vec<String> = matches
+        .get_many::<String>("input")
+        .unwrap()
+        .map(|s| s.to_string())
+        .collect();
     let output = matches.get_one::<String>("output").unwrap();
-
-    // ABSOLUTE |ΔP| tolerance (seconds)
     let ptol_abs: f64 = matches.get_one::<String>("ptol").unwrap().parse()?;
-
-    // Optional gates
     let dm_tol: Option<f64> = matches.get_one::<String>("dmtol").and_then(|s| s.parse().ok());
     let acc_tol: Option<f64> = matches.get_one::<String>("acctol").and_then(|s| s.parse().ok());
-
-    // Harmonics toggle (default ON)
     let allow_harmonics = !matches.get_flag("no_harmonics");
-
-    // Optional TOBS
     let tobs_seconds: Option<f64> = matches.get_one::<String>("tobs").and_then(|s| s.parse().ok());
+    let source_col: Option<&str> = matches.get_one::<String>("source_col").map(|s| s.as_str());
 
-    cluster_csv(
-        input,
-        output,
-        ptol_abs,
-        dm_tol,
-        acc_tol,
-        allow_harmonics,
-        tobs_seconds,
-    )
+    if inputs.len() == 1 {
+        cluster_csv(
+            &inputs[0],
+            output,
+            ptol_abs,
+            dm_tol,
+            acc_tol,
+            allow_harmonics,
+            tobs_seconds,
+        )
+    } else {
+        cluster_csv_multi(
+            &inputs,
+            output,
+            ptol_abs,
+            dm_tol,
+            acc_tol,
+            allow_harmonics,
+            tobs_seconds,
+            source_col,
+        )
+    }
 }
