@@ -1,256 +1,372 @@
-use anyhow::Result;
-use csv::{ReaderBuilder, WriterBuilder};
-use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+// src/csv_cluster.rs
+use anyhow::{anyhow, Context, Result};
+use csv::{ReaderBuilder, StringRecord, Writer};
+use std::cmp::Ordering;
+use std::fs::File;
+use std::path::Path;
 
 const SPEED_OF_LIGHT: f64 = 299_792_458.0;
 
-/// Minimal fields used for clustering (we still write full rows later).
-#[derive(Debug, Clone, Deserialize)]
-pub struct CsvCandidate {
-    pub id: usize,          // we’ll fill this from "#id" or "id"
-    pub dm_new: f64,
-    pub p0_new: f64,
-    pub acc_new: f64,
-    pub snr_new: f64,       // "S/N_new"
+#[derive(Clone, Debug)]
+struct RowView {
+    /// The complete, original row (all columns, in order).
+    row: Vec<String>,
+    /// Source filename (optional column in output).
+    source: String,
+    /// Extracted fields for clustering:
+    period_s: f64,
+    dm: f64,
+    acc: f64,
+    snr: f64,
 }
 
-/// Absolute period tolerance with optional DM/ACC gates and optional harmonics.
-fn is_related_abs(
-    a: &CsvCandidate,
-    b: &CsvCandidate,
-    ptol_abs: f64,                   // |ΔP| tolerance (seconds)
-    dm_tol: Option<f64>,             // if Some, require |ΔDM| ≤ dm_tol
-    acc_tol: Option<f64>,            // if Some, require |ΔACC| ≤ acc_tol
-    tobs_over_c: f64,                // TOBS / c
-    allow_harmonics: bool,           // C++-like modulo catch
+/// Which column set we’re using.
+#[derive(Clone, Copy, Debug)]
+enum Schema {
+    FoldSearch, // (#id, dm_new, p0_new, acc_new, S/N_new, ...)
+    Pics,       // (dm_opt, f0_opt, acc_opt, sn_fold, ...)
+}
+
+#[derive(Clone, Debug)]
+struct ColMap {
+    #[allow(dead_code)]
+    schema: Schema,
+    idx_period_like: usize, // p0_new or f0_opt
+    idx_dm: usize,          // dm_new or dm_opt
+    idx_acc: usize,         // acc_new or acc_opt
+    idx_snr: usize,         // S/N_new or sn_fold
+    // Whether idx_period_like is already a period (true) or a frequency f0 (false).
+    is_period: bool,
+}
+
+fn find_col(header: &StringRecord, name: &str) -> Option<usize> {
+    header.iter().position(|h| h.trim() == name)
+}
+
+fn detect_schema(header: &StringRecord) -> Result<ColMap> {
+    // Try FoldSearch first
+    if let (Some(i_p0), Some(i_dm), Some(i_acc), Some(i_snr)) = (
+        find_col(header, "p0_new"),
+        find_col(header, "dm_new"),
+        find_col(header, "acc_new"),
+        find_col(header, "S/N_new"),
+    ) {
+        return Ok(ColMap {
+            schema: Schema::FoldSearch,
+            idx_period_like: i_p0,
+            idx_dm: i_dm,
+            idx_acc: i_acc,
+            idx_snr: i_snr,
+            is_period: true,
+        });
+    }
+
+    // Then PICS / TRAPUM style
+    if let (Some(i_f0), Some(i_dm), Some(i_acc), Some(i_snr)) = (
+        find_col(header, "f0_opt"),
+        find_col(header, "dm_opt"),
+        find_col(header, "acc_opt"),
+        find_col(header, "sn_fold"),
+    ) {
+        return Ok(ColMap {
+            schema: Schema::Pics,
+            idx_period_like: i_f0,
+            idx_dm: i_dm,
+            idx_acc: i_acc,
+            idx_snr: i_snr,
+            is_period: false, // it's f0; convert to period = 1/f0
+        });
+    }
+
+    Err(anyhow!(
+        "Unsupported CSV header: could not find either \
+         (p0_new, dm_new, acc_new, S/N_new) or (f0_opt, dm_opt, acc_opt, sn_fold)."
+    ))
+}
+
+fn parse_row(cols: &ColMap, rec: &StringRecord, src: &str) -> Option<RowView> {
+    // Defensive: ensure row has enough columns
+    let get = |i: usize| rec.get(i).unwrap_or("").trim();
+
+    let dm = get(cols.idx_dm).parse::<f64>().ok()?;
+    let acc = get(cols.idx_acc).parse::<f64>().ok()?;
+    let snr = get(cols.idx_snr).parse::<f64>().ok()?;
+
+    let period_s = if cols.is_period {
+        let p = get(cols.idx_period_like).parse::<f64>().ok()?;
+        if p <= 0.0 || !p.is_finite() {
+            return None;
+        }
+        p
+    } else {
+        // f0 → period
+        let f0 = get(cols.idx_period_like).parse::<f64>().ok()?;
+        if f0 <= 0.0 || !f0.is_finite() {
+            return None;
+        }
+        1.0 / f0
+    };
+
+    // Keep entire row as Vec<String>
+    let row: Vec<String> = rec.iter().map(|s| s.to_string()).collect();
+
+    Some(RowView {
+        row,
+        source: src.to_string(),
+        period_s,
+        dm,
+        acc,
+        snr,
+    })
+}
+
+/// Acceleration-aware period match with optional harmonics.
+fn periods_match(
+    a: &RowView,
+    b: &RowView,
+    ptol_abs: f64,
+    dmtol: Option<f64>,
+    acctol: Option<f64>,
+    allow_harmonics: bool,
+    tobs_opt: Option<f64>,
 ) -> bool {
-    if let Some(dm) = dm_tol {
-        if (a.dm_new - b.dm_new).abs() > dm {
+    // Optional gates first
+    if let Some(d) = dmtol {
+        if (a.dm - b.dm).abs() > d {
             return false;
         }
     }
-    if let Some(at) = acc_tol {
-        if (a.acc_new - b.acc_new).abs() > at {
+    if let Some(t) = acctol {
+        if (a.acc - b.acc).abs() > t {
             return false;
         }
     }
 
-    // acceleration-corrected period for b relative to a
-    let f0_b = 1.0 / b.p0_new;
-    let corrected_b_period = 1.0 / (f0_b - (b.acc_new - a.acc_new) * f0_b * tobs_over_c);
+    // Acceleration correction (match b to a's frame)
+    let tobs_over_c = tobs_opt.unwrap_or(600.0) / SPEED_OF_LIGHT;
+    let f0_b = 1.0 / b.period_s;
+    let p_b_corr = 1.0 / (f0_b - (b.acc - a.acc) * f0_b * tobs_over_c);
 
-    let delta_abs = (a.p0_new - corrected_b_period).abs();
-    if delta_abs <= ptol_abs {
-        return true;
+    if !allow_harmonics {
+        return (a.period_s - p_b_corr).abs() <= ptol_abs;
     }
 
-    if allow_harmonics {
-        // modulo-style harmonic capture
-        let (larger, smaller) = if a.p0_new >= corrected_b_period {
-            (a.p0_new, corrected_b_period)
-        } else {
-            (corrected_b_period, a.p0_new)
-        };
-        let true_period_difference = larger % smaller;
-        if true_period_difference <= ptol_abs {
+    // Harmonic-aware: check small integer multiples up to 16
+    // Test |p_a - k * p_b| <= ptol OR |k * p_a - p_b| <= ptol
+    const HMAX: usize = 16;
+    for k in 1..=HMAX {
+        let kf = k as f64;
+        if (a.period_s - kf * p_b_corr).abs() <= ptol_abs {
+            return true;
+        }
+        if (kf * a.period_s - p_b_corr).abs() <= ptol_abs {
             return true;
         }
     }
-
     false
 }
 
-/// Backward-compat single-file entry point (calls the multi-file version).
-pub fn cluster_csv(
-    input: &str,
-    output: &str,
+/// Greedy SNR-first clustering. Higher SNR rows win; all related rows are suppressed.
+fn cluster_rows(
+    mut rows: Vec<RowView>,
     ptol_abs: f64,
-    dm_tol: Option<f64>,
-    acc_tol: Option<f64>,
+    dmtol: Option<f64>,
+    acctol: Option<f64>,
     allow_harmonics: bool,
-    tobs_seconds: Option<f64>,
-) -> Result<()> {
-    cluster_csv_multi(
-        &vec![input.to_string()],
-        output,
-        ptol_abs,
-        dm_tol,
-        acc_tol,
-        allow_harmonics,
-        tobs_seconds,
-        None, // no source column by default
-    )
+    tobs_opt: Option<f64>,
+) -> Vec<RowView> {
+    // Sort by SNR descending so the first time we see a cluster we keep the strongest.
+    rows.sort_by(|a, b| {
+        // NaNs sorted to end, otherwise descending snr
+        if !a.snr.is_finite() && !b.snr.is_finite() {
+            Ordering::Equal
+        } else if !a.snr.is_finite() {
+            Ordering::Greater
+        } else if !b.snr.is_finite() {
+            Ordering::Less
+        } else {
+            b.snr
+                .partial_cmp(&a.snr)
+                .unwrap_or(Ordering::Equal)
+        }
+    });
+
+    let n = rows.len();
+    let mut removed = vec![false; n];
+    let mut picked = Vec::with_capacity(n);
+
+    for i in 0..n {
+        if removed[i] {
+            continue;
+        }
+        // Keep this as the pivot
+        picked.push(rows[i].clone());
+
+        // Remove anything related to this pivot
+        for j in (i + 1)..n {
+            if removed[j] {
+                continue;
+            }
+            if periods_match(
+                &rows[i],
+                &rows[j],
+                ptol_abs,
+                dmtol,
+                acctol,
+                allow_harmonics,
+                tobs_opt,
+            ) {
+                removed[j] = true;
+            }
+        }
+    }
+
+    picked
 }
 
-/// Multi-file clustering: cluster across ALL inputs together and write full rows.
+/// Read a CSV, detect schema, return (header, rows)
+fn read_one_csv(path: &str) -> Result<(Vec<String>, Vec<RowView>)> {
+    let file = File::open(path).with_context(|| format!("open {}", path))?;
+    let mut rdr = ReaderBuilder::new()
+        .has_headers(true)
+        .from_reader(file);
+
+    let hdr = rdr
+        .headers()
+        .with_context(|| format!("read header of {}", path))?
+        .clone();
+    let colmap = detect_schema(&hdr).with_context(|| format!("detect schema in {}", path))?;
+
+    let header_vec: Vec<String> = hdr.iter().map(|s| s.to_string()).collect();
+
+    let mut out_rows = Vec::new();
+    for rec in rdr.records() {
+        let rec = rec?;
+        if let Some(view) = parse_row(&colmap, &rec, Path::new(path).file_name().unwrap_or_default().to_string_lossy().as_ref()) {
+            out_rows.push(view);
+        }
+    }
+
+    Ok((header_vec, out_rows))
+}
+
+/// Write rows with the header (plus optional source_col appended).
+fn write_csv(output: &str, header: &[String], rows: &[RowView], source_col: Option<&str>) -> Result<()> {
+    let mut wtr = Writer::from_path(output)
+        .with_context(|| format!("create output {}", output))?;
+
+    if let Some(sc) = source_col {
+        // header + source_col
+        let mut hdr_out = header.to_vec();
+        hdr_out.push(sc.to_string());
+        let hdr_ref: Vec<&str> = hdr_out.iter().map(|s| s.as_str()).collect();
+        wtr.write_record(&hdr_ref)?;
+        for r in rows {
+            let mut row = r.row.clone();
+            row.push(r.source.clone());
+            wtr.write_record(row)?;
+        }
+    } else {
+        let hdr_ref: Vec<&str> = header.iter().map(|s| s.as_str()).collect();
+        wtr.write_record(&hdr_ref)?;
+        for r in rows {
+            wtr.write_record(&r.row)?;
+        }
+    }
+
+    wtr.flush()?;
+    Ok(())
+}
+
+/// Public entry called from the bin.
+///
+/// - `inputs`: one or more CSV paths
+/// - `output`: output CSV
+/// - `ptol_abs`: absolute period tolerance (seconds)
+/// - `dmtol`: optional |ΔDM| gate
+/// - `acctol`: optional |ΔACC| gate
+/// - `allow_harmonics`: enable/disable harmonic matching
+/// - `tobs_opt`: optional TOBS seconds for acceleration correction (default 600s if None)
+/// - `source_col`: optional new column name to append with the source filename
 pub fn cluster_csv_multi(
     inputs: &[String],
     output: &str,
     ptol_abs: f64,
-    dm_tol: Option<f64>,
-    acc_tol: Option<f64>,
+    dmtol: Option<f64>,
+    acctol: Option<f64>,
     allow_harmonics: bool,
-    tobs_seconds: Option<f64>,
-    source_col: Option<&str>, // optionally add a column with the source filename
+    tobs_opt: Option<f64>,
+    source_col: Option<&str>,
 ) -> Result<()> {
-    println!("[INFO] Reading {} CSV(s)", inputs.len());
-
-    // Union of headers across all inputs (preserve order: first-seen wins).
-    let mut headers_union: Vec<String> = Vec::new();
-    let mut headers_seen: HashSet<String> = HashSet::new();
-
-    // Full rows aligned with clustering candidates (only rows we can parse).
-    let mut full_rows: Vec<HashMap<String, String>> = Vec::new();
-    let mut cluster_records: Vec<CsvCandidate> = Vec::new();
-
-    // Pass over all files
-    for input in inputs {
-        let mut rdr = ReaderBuilder::new().has_headers(true).from_path(input)?;
-
-        // Update union headers
-        let hdr = rdr.headers()?.clone();
-        for h in hdr.iter() {
-            if headers_seen.insert(h.to_string()) {
-                headers_union.push(h.to_string());
-            }
-        }
-        // If user asked to add a provenance column, ensure it's in the union.
-        if let Some(col) = source_col {
-            if headers_seen.insert(col.to_string()) {
-                headers_union.push(col.to_string());
-            }
-        }
-
-        // Find required columns (support both "#id" and "id", and "S/N_new")
-        let idx_id = hdr
-            .iter()
-            .position(|s| s == "#id" || s == "id")
-            .ok_or_else(|| anyhow::anyhow!(format!("{input}: missing '#id' or 'id' column")))?;
-        let idx_dm = hdr
-            .iter()
-            .position(|s| s == "dm_new")
-            .ok_or_else(|| anyhow::anyhow!(format!("{input}: missing 'dm_new' column")))?;
-        let idx_p0 = hdr
-            .iter()
-            .position(|s| s == "p0_new")
-            .ok_or_else(|| anyhow::anyhow!(format!("{input}: missing 'p0_new' column")))?;
-        let idx_acc = hdr
-            .iter()
-            .position(|s| s == "acc_new")
-            .ok_or_else(|| anyhow::anyhow!(format!("{input}: missing 'acc_new' column")))?;
-        let idx_snr = hdr
-            .iter()
-            .position(|s| s == "S/N_new")
-            .ok_or_else(|| anyhow::anyhow!(format!("{input}: missing 'S/N_new' column")))?;
-
-        for rec in rdr.records() {
-            let rec = rec?;
-
-            // Parse needed fields; if any parse fails, skip the row.
-            let id_str = rec.get(idx_id).unwrap_or_default();
-            let dm_str = rec.get(idx_dm).unwrap_or_default();
-            let p0_str = rec.get(idx_p0).unwrap_or_default();
-            let ac_str = rec.get(idx_acc).unwrap_or_default();
-            let sn_str = rec.get(idx_snr).unwrap_or_default();
-
-            let (id, dm, p0, ac, sn) = match (id_str.parse::<usize>(),
-                                               dm_str.parse::<f64>(),
-                                               p0_str.parse::<f64>(),
-                                               ac_str.parse::<f64>(),
-                                               sn_str.parse::<f64>()) {
-                (Ok(id), Ok(dm), Ok(p0), Ok(ac), Ok(sn)) => (id, dm, p0, ac, sn),
-                _ => {
-                    // silently skip malformed row
-                    continue;
-                }
-            };
-
-            // Build the full-row map for output (with current file’s headers)
-            let mut map: HashMap<String, String> = HashMap::with_capacity(headers_union.len());
-            for (h, v) in hdr.iter().zip(rec.iter()) {
-                map.insert(h.to_string(), v.to_string());
-            }
-            if let Some(col) = source_col {
-                map.insert(col.to_string(), input.to_string());
-            }
-
-            // Push only if we can cluster it
-            full_rows.push(map);
-            cluster_records.push(CsvCandidate {
-                id,
-                dm_new: dm,
-                p0_new: p0,
-                acc_new: ac,
-                snr_new: sn,
-            });
-        }
+    if inputs.is_empty() {
+        return Err(anyhow!("No input CSVs provided"));
     }
-
-    if cluster_records.is_empty() {
-        println!("[WARN] No candidates parsed from inputs");
-        return Ok(());
-    }
-
-    // TOBS/c factor
-    let tobs = tobs_seconds.unwrap_or(3600.0);
-    let tobs_over_c = tobs / SPEED_OF_LIGHT;
-
-    // Greedy clustering over all inputs; pick highest S/N as pivot
-    let n = cluster_records.len();
-    let mut clustered = vec![false; n];
-    let mut picked_idx = Vec::new();
-
-    for i in 0..n {
-        if clustered[i] { continue; }
-        let mut members = vec![i];
-        clustered[i] = true;
-
-        for j in (i + 1)..n {
-            if clustered[j] { continue; }
-            if is_related_abs(
-                &cluster_records[i],
-                &cluster_records[j],
-                ptol_abs,
-                dm_tol,
-                acc_tol,
-                tobs_over_c,
-                allow_harmonics,
-            ) {
-                clustered[j] = true;
-                members.push(j);
-            }
-        }
-
-        let pivot = *members
-            .iter()
-            .max_by(|&&a, &&b| {
-                cluster_records[a]
-                    .snr_new
-                    .partial_cmp(&cluster_records[b].snr_new)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .unwrap();
-        picked_idx.push(pivot);
-    }
-
-    // Write the union headers and full rows for pivots
-    let mut wtr = WriterBuilder::new().has_headers(true).from_path(output)?;
-    wtr.write_record(headers_union.iter())?;
-    for &i in &picked_idx {
-        let row = &full_rows[i];
-        let vals: Vec<&str> = headers_union
-            .iter()
-            .map(|h| row.get(h).map(|s| s.as_str()).unwrap_or(""))
-            .collect();
-        wtr.write_record(vals)?;
-    }
-    wtr.flush()?;
 
     println!(
-        "[INFO] Clustering complete across {} file(s). Wrote {} picked candidates to {}",
+        "[INFO] Reading {} input CSV(s)… (ptol={}, dmtol={:?}, acctol={:?}, harmonics={}, tobs={:?})",
         inputs.len(),
-        picked_idx.len(),
+        ptol_abs,
+        dmtol,
+        acctol,
+        allow_harmonics,
+        tobs_opt
+    );
+
+    let mut all_rows: Vec<RowView> = Vec::new();
+    let mut first_header: Option<Vec<String>> = None;
+
+    for (k, p) in inputs.iter().enumerate() {
+        let (hdr, mut rows) = read_one_csv(p)?;
+        println!(
+            "[INFO]  {}. {} → {} rows",
+            k + 1,
+            p,
+            rows.len()
+        );
+
+        // Track the first header; if subsequent headers differ in content or length, we still proceed
+        // but keep the first header for output. This guarantees stable output schema.
+        if let Some(prev) = first_header.as_ref() {
+            let same_len = prev.len() == hdr.len();
+            let same_elems = same_len && prev.iter().zip(&hdr).all(|(a, b)| a == b);
+            if !same_elems {
+                eprintln!(
+                    "[WARN] Header of {} differs from the first file; \
+                     proceeding but output header will follow the first file.",
+                    p
+                );
+            }
+        } else {
+            first_header = Some(hdr);
+        }
+
+        all_rows.append(&mut rows);
+    }
+
+    if all_rows.is_empty() {
+        return Err(anyhow!("No valid rows parsed from inputs"));
+    }
+
+    println!(
+        "[INFO] Total rows read: {}. Clustering…",
+        all_rows.len()
+    );
+
+    let picked = cluster_rows(
+        all_rows,
+        ptol_abs,
+        dmtol,
+        acctol,
+        allow_harmonics,
+        tobs_opt,
+    );
+
+    let header = first_header.unwrap();
+    write_csv(output, &header, &picked, source_col)?;
+
+    println!(
+        "[INFO] Clustering complete. Wrote {} picked rows to {}",
+        picked.len(),
         output
     );
     Ok(())

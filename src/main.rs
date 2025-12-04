@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use clap::{Arg, Command};
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use xmltree::{Element, EmitterConfig};
 
@@ -85,6 +85,54 @@ impl Candidate {
             || (self.period - corrected_other_period).abs() <= period_thresh
     }
 }
+
+#[derive(Debug, Clone)]
+struct Birdie {
+    freq: f64, // Hz
+    width: f64, // Hz (half width)
+}
+
+fn parse_birdies<P: AsRef<std::path::Path>>(path: P) -> anyhow::Result<Vec<Birdie>> {
+    let txt = std::fs::read_to_string(&path)?;
+    let mut out = Vec::new();
+    for (lineno, line) in txt.lines().enumerate() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') { continue; }
+        let cols: Vec<&str> = t.split_whitespace().collect();
+        if cols.len() < 2 {
+            return Err(anyhow::anyhow!(
+                "bidies file {} line {}: expected 'freq width'",
+                path.as_ref().display(),
+                lineno + 1
+                ));
+        }
+        let freq: f64 = cols[0].parse()?;
+        let width: f64 = cols[1].parse()?;
+        if freq > 0.0 && width > 0.0 {
+            out.push(Birdie { freq, width });
+        }
+    }
+    Ok(out)
+}
+
+// Build [f_lo and f_hi] windows for each birdie and its harmonics.
+// if scale_width is true, the k-th harmonic gets widht * k ; else width is constant. 
+fn build_birdie_windows(birds: &[Birdie], hmax: u32, scale_width: bool) -> Vec<(f64, f64)> {
+    let mut wins = Vec::with_capacity(birds.len() * (hmax as usize));
+    for b in birds {
+        for k in 1..=hmax {
+            let kf = (k as f64) * b.freq;
+            if kf <= 0.0 { continue; }
+            let full_w = if scale_width { (k as f64) * b.width } else { b.width };
+            let half = 0.5 * full_w;
+            wins.push((kf - half, kf + half));
+        }
+    }
+    // Optional: sort for cache-friendliness (not strictly needed) // suggested by chatgpt 
+    wins.sort_by(|a,b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    wins
+} 
+
 
 #[derive(Debug)]
 struct XmlSections {
@@ -237,9 +285,16 @@ fn cluster_candidates(cands: &mut [Candidate], period_thresh: f64, dm_thresh: Op
     println!("[INFO] Finished clustering.");
 }
 
-fn shortlist_candidates(cands: &mut [Candidate]) -> Vec<usize> {
+fn shortlist_candidates(
+    cands: &mut [Candidate],
+    birdies: Option<&[Birdie]>,
+    birdie_harmonics: u32,
+    scale_birdie_width: bool,
+    ) -> Vec<usize> {
     println!("[INFO] Shortlisting pivots...");
-    let mut to_remove: HashSet<usize> = HashSet::new();
+    let mut to_remove: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+    // 1) clustering-based pruning: keep a single pivot per related group
     for i in 0..cands.len() {
         if cands[i].related.len() > 1 {
             for &r in &cands[i].related {
@@ -247,6 +302,33 @@ fn shortlist_candidates(cands: &mut [Candidate]) -> Vec<usize> {
             }
         }
     }
+
+    // 2) Birdie + harmonic pruning
+    if let Some(birds) = birdies {
+        let windows = build_birdie_windows(birds, birdie_harmonics, scale_birdie_width);
+        let mut rfi_hits = 0usize;
+
+        'cand: for i in 0..cands.len() {
+            if to_remove.contains(&i) { continue; }
+            let f0 = cands[i].f0; // Hz
+
+            // Simple scan is fine for modest window counts
+            for &(lo, hi) in &windows {
+                if f0 >= lo && f0 <= hi {
+                    to_remove.insert(i);
+                    rfi_hits += 1;
+                    continue 'cand;
+                }
+            }
+        }
+
+        println!(
+            "[INFO] Birdie pruning (with harmonics up to k={}) removed {} candidates.",
+            birdie_harmonics, rfi_hits
+        );
+    }
+
+    // Mark remaining as pivots
     let mut pivots = Vec::new();
     for (i, c) in cands.iter_mut().enumerate() {
         if !to_remove.contains(&i) {
@@ -381,6 +463,9 @@ fn main() -> Result<()> {
         .arg(Arg::new("ncpus").short('n').num_args(1).default_value("8"))
         .arg(Arg::new("bin_dm").long("bin-dm").action(clap::ArgAction::SetTrue))
         .arg(Arg::new("xml_files").num_args(1..).required(true))
+        .arg(Arg::new("birdies").short('B').long("birdies").num_args(1).help("Optional file with 'freq width' pairs (Hz) to prune as RFI"))
+        .arg(Arg::new("birdies_harmonics").long("birdie-harmonics").short('H').num_args(1).value_name("N").default_value("16").help("Max harmonic multiple to reject for each birdie (k=1..N)"))
+        .arg(Arg::new("scale_birdie_width").short('W').long("scale-birdie-width").action(clap::ArgAction::SetTrue).help("Scale the birdie width by k for the k-th harmonic"))
         .get_matches();
 
     let period_thresh: f64 = matches.get_one::<String>("period_thresh").unwrap().parse()?;
@@ -388,6 +473,9 @@ fn main() -> Result<()> {
     let ncpus: usize = matches.get_one::<String>("ncpus").unwrap().parse()?;
     let bin_dm: bool = matches.get_flag("bin_dm");
     let xml_files: Vec<String> = matches.get_many::<String>("xml_files").unwrap().map(|s| s.to_string()).collect();
+    let birdies_vec: Option<Vec<Birdie>> = matches.get_one::<String>("birdies").map(|p| parse_birdies(p)).transpose()?; // Option<Result<_>> -> Result<Option<_>>
+    let birdie_harmonics: u32 = matches.get_one::<String>("birdie_harmonics").unwrap().parse()?;
+    let scale_birdie_width: bool = matches.get_flag("scale_birdie_width");
 
     println!("[INFO] Settings: period_thresh={period_thresh}, dm_thresh={:?}, workers={ncpus}, bin_dm={bin_dm}", dm_thresh);
     rayon::ThreadPoolBuilder::new().num_threads(ncpus).build_global().unwrap();
@@ -414,7 +502,7 @@ fn main() -> Result<()> {
     println!("[INFO] Effective TOBS: {effective_tobs} s");
 
     cluster_candidates(&mut all_candidates, period_thresh, dm_thresh, tobs_over_c, bin_dm);
-    let pivots = shortlist_candidates(&mut all_candidates);
+    let pivots = shortlist_candidates(&mut all_candidates, birdies_vec.as_deref(), birdie_harmonics, scale_birdie_width,);
     save_candidates_csv(&all_candidates, &pivots, "pivots.csv")?;
 
     let mut pivot_map: HashMap<(String,i32), bool> = HashMap::new();
