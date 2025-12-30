@@ -1,8 +1,9 @@
 use anyhow::{anyhow, Result};
-use clap::{Arg, Command};
+use clap::{Arg, ArgAction, Command};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use xmltree::{Element, EmitterConfig};
 
 const SPEED_OF_LIGHT: f64 = 299_792_458.0;
@@ -30,109 +31,50 @@ struct Candidate {
 }
 
 impl Candidate {
-    fn new(
-        snr: f64,
-        period: f64,
-        dm: f64,
-        acc: f64,
-        nh: i32,
-        ddm_count_ratio: f32,
-        ddm_snr_ratio: f32,
-        nassoc: i32,
-        uuid: Option<String>,
-        xml_file: String,
-        candidate_id: i32,
-        raw_xml: String,
-    ) -> Self {
+    fn new(snr: f64, period: f64, dm: f64, acc: f64, nh: i32, ddm_count_ratio: f32, ddm_snr_ratio: f32, nassoc: i32, uuid: Option<String>, xml_file: String, candidate_id: i32, raw_xml: String) -> Self {
         let f0 = 1.0 / period;
         let period_ms = (period * 1000.0).round() as i32;
         let pulse_width = period / 2.0f64.powi(nh);
-        Self {
-            snr,
-            period,
-            f0,
-            dm,
-            acc,
-            nh,
-            ddm_count_ratio,
-            ddm_snr_ratio,
-            nassoc,
-            period_ms,
-            pulse_width,
-            uuid,
-            xml_file,
-            candidate_id,
-            raw_xml,
-            related: Vec::new(),
-            is_pivot: false,
-        }
+        Self { snr, period, f0, dm, acc, nh, ddm_count_ratio, ddm_snr_ratio, nassoc, period_ms, pulse_width, uuid, xml_file, candidate_id, raw_xml, related: Vec::new(), is_pivot: false }
     }
-
     fn is_related(&self, other: &Candidate, period_thresh: f64, dm_thresh: Option<f64>, tobs_over_c: f64) -> bool {
-        if let Some(dmth) = dm_thresh {
-            if (self.dm - other.dm).abs() > dmth {
-                return false;
-            }
-        }
-        let corrected_other_period =
-            1.0 / (other.f0 - (other.acc - self.acc) * other.f0 * tobs_over_c);
-        let true_period_difference = if (self.period / corrected_other_period) > 1.0 {
-            self.period % corrected_other_period
-        } else {
-            corrected_other_period % self.period
-        };
-        true_period_difference <= period_thresh
-            || (self.period - corrected_other_period).abs() <= period_thresh
+        if let Some(dmth) = dm_thresh { if (self.dm - other.dm).abs() > dmth { return false; } }
+        let corrected_other_period = 1.0 / (other.f0 - (other.acc - self.acc) * other.f0 * tobs_over_c);
+        let true_period_difference = if (self.period / corrected_other_period) > 1.0 { self.period % corrected_other_period } else { corrected_other_period % self.period };
+        true_period_difference <= period_thresh || (self.period - corrected_other_period).abs() <= period_thresh
     }
 }
 
-#[derive(Debug, Clone)]
-struct Birdie {
-    freq: f64, // Hz
-    width: f64, // Hz (half width)
-}
+#[derive(Clone, Copy, Debug)]
+struct Birdie { freq_hz: f64, half_width_hz: f64 }
 
-fn parse_birdies<P: AsRef<std::path::Path>>(path: P) -> anyhow::Result<Vec<Birdie>> {
-    let txt = std::fs::read_to_string(&path)?;
-    let mut out = Vec::new();
-    for (lineno, line) in txt.lines().enumerate() {
-        let t = line.trim();
-        if t.is_empty() || t.starts_with('#') { continue; }
-        let cols: Vec<&str> = t.split_whitespace().collect();
-        if cols.len() < 2 {
-            return Err(anyhow::anyhow!(
-                "bidies file {} line {}: expected 'freq width'",
-                path.as_ref().display(),
-                lineno + 1
-                ));
-        }
-        let freq: f64 = cols[0].parse()?;
-        let width: f64 = cols[1].parse()?;
-        if freq > 0.0 && width > 0.0 {
-            out.push(Birdie { freq, width });
-        }
-    }
-    Ok(out)
-}
-
-// Build [f_lo and f_hi] windows for each birdie and its harmonics.
-// if scale_width is true, the k-th harmonic gets widht * k ; else width is constant. 
 fn build_birdie_windows(birds: &[Birdie], hmax: u32, scale_width: bool) -> Vec<(f64, f64)> {
-    let mut wins = Vec::with_capacity(birds.len() * (hmax as usize));
+    let mut wins = Vec::with_capacity(birds.len().saturating_mul(hmax as usize));
     for b in birds {
         for k in 1..=hmax {
-            let kf = (k as f64) * b.freq;
+            let kf = (k as f64) * b.freq_hz;
             if kf <= 0.0 { continue; }
-            let full_w = if scale_width { (k as f64) * b.width } else { b.width };
-            let half = 0.5 * full_w;
+            let half = if scale_width { (k as f64) * b.half_width_hz } else { b.half_width_hz };
             wins.push((kf - half, kf + half));
         }
     }
-    // Optional: sort for cache-friendliness (not strictly needed) // suggested by chatgpt 
-    wins.sort_by(|a,b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    wins.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     wins
-} 
+}
 
+fn load_birdies(path: &str) -> Result<Vec<Birdie>> {
+    let r = BufReader::new(std::fs::File::open(path)?);
+    let mut out = Vec::new();
+    for (i, l) in r.lines().enumerate() {
+        let s = l?;
+        let t = s.trim();
+        if t.is_empty() || t.starts_with('#') || t.starts_with("//") { continue; }
+        let c: Vec<&str> = if t.contains(',') { t.split(',').map(|x| x.trim()).collect() } else { t.split_whitespace().collect() };
+        if c.len() < 2 { return Err(anyhow!("birdies: line {} needs 'freq width': {}", i + 1, s)); }
+        out.push(Birdie { freq_hz: c[0].parse()?, half_width_hz: c[1].parse()? });
+    }
+    Ok(out)
+}
 
 #[derive(Debug)]
 struct XmlSections {
@@ -157,9 +99,8 @@ struct XmlFile {
 
 fn element_to_string(e: &Element) -> String {
     let mut buf = Vec::new();
-    e.write_with_config(&mut buf, EmitterConfig::new().perform_indent(true))
-        .expect("serialize element");
-    String::from_utf8(buf).unwrap()
+    e.write_with_config(&mut buf, EmitterConfig::new().perform_indent(true)).expect("serialize element");
+    String::from_utf8(buf).unwrap_or_default()
 }
 
 fn slice_candidate_block(xml: &str, id: i32) -> Option<String> {
@@ -175,38 +116,25 @@ fn slice_candidate_block(xml: &str, id: i32) -> Option<String> {
 
 fn get_text_path(root: &Element, path: &[&str]) -> Option<String> {
     let mut cur = root;
-    for &p in path {
-        cur = cur.get_child(p)?;
-    }
+    for &p in path { cur = cur.get_child(p)?; }
     cur.get_text().map(|cow| cow.to_string())
 }
 
 fn get_text_child(el: &Element, tag: &str, filename: &str) -> Result<String> {
-    el.get_child(tag)
-        .and_then(|e| e.get_text().map(|cow| cow.to_string()))
-        .ok_or_else(|| anyhow!("Missing <{}> in {}", tag, filename))
+    el.get_child(tag).and_then(|e| e.get_text().map(|cow| cow.to_string())).ok_or_else(|| anyhow!("Missing <{}> in {}", tag, filename))
 }
 
 fn parse_xml_file(filename: &str) -> Result<XmlFile> {
     println!("[INFO] Parsing {filename}");
     let content = fs::read_to_string(filename)?;
     let root: Element = Element::parse(content.as_bytes())?;
-
-    let tsamp: f64 = get_text_path(&root, &["header_parameters", "tsamp"])
-        .ok_or_else(|| anyhow!("Missing tsamp in {}", filename))?
-        .parse()?;
-
-    let fft_size: i64 = get_text_path(&root, &["search_parameters", "size"])
-        .ok_or_else(|| anyhow!("Missing fft size in {}", filename))?
-        .parse()?;
-
+    let tsamp: f64 = get_text_path(&root, &["header_parameters", "tsamp"]).ok_or_else(|| anyhow!("Missing tsamp in {}", filename))?.parse()?;
+    let fft_size: i64 = get_text_path(&root, &["search_parameters", "size"]).ok_or_else(|| anyhow!("Missing fft size in {}", filename))?.parse()?;
     let mut candidates = Vec::new();
     if let Some(cands_el) = root.get_child("candidates") {
         for cand_el in &cands_el.children {
             if let xmltree::XMLNode::Element(e) = cand_el {
-                let cid = e.attributes.get("id")
-                    .ok_or_else(|| anyhow!("Candidate missing id in {}", filename))?
-                    .parse::<i32>()?;
+                let cid = e.attributes.get("id").ok_or_else(|| anyhow!("Candidate missing id in {}", filename))?.parse::<i32>()?;
                 let period: f64 = get_text_child(e, "period", filename)?.parse()?;
                 let dm: f64 = get_text_child(e, "dm", filename)?.parse()?;
                 let acc: f64 = get_text_child(e, "acc", filename)?.parse()?;
@@ -217,15 +145,10 @@ fn parse_xml_file(filename: &str) -> Result<XmlFile> {
                 let nassoc: i32 = get_text_child(e, "nassoc", filename)?.parse()?;
                 let uuid = get_text_path(e, &["search_candidates_database_uuid"]);
                 let raw_xml = slice_candidate_block(&content, cid).unwrap_or_else(|| element_to_string(e));
-                candidates.push(Candidate::new(
-                    snr, period, dm, acc, nh,
-                    ddm_count_ratio, ddm_snr_ratio, nassoc,
-                    uuid, filename.to_string(), cid, raw_xml,
-                ));
+                candidates.push(Candidate::new(snr, period, dm, acc, nh, ddm_count_ratio, ddm_snr_ratio, nassoc, uuid, filename.to_string(), cid, raw_xml));
             }
         }
     }
-
     let sections = XmlSections {
         misc_info: root.get_child("misc_info").map(element_to_string),
         header_parameters: root.get_child("header_parameters").map(element_to_string),
@@ -236,7 +159,6 @@ fn parse_xml_file(filename: &str) -> Result<XmlFile> {
         cuda_device_parameters: root.get_child("cuda_device_parameters").map(element_to_string),
         execution_times: root.get_child("execution_times").map(element_to_string),
     };
-
     println!("[INFO] Parsed {filename}: {} candidates", candidates.len());
     Ok(XmlFile { filename: filename.to_string(), sections, fft_size, tsamp, candidates })
 }
@@ -247,40 +169,17 @@ fn cluster_candidates(cands: &mut [Candidate], period_thresh: f64, dm_thresh: Op
     if bin_dm {
         let mut bins: HashMap<i64, Vec<usize>> = HashMap::new();
         for (i, c) in cands.iter().enumerate() {
-            let b = if let Some(dmth) = dm_thresh {
-                (c.dm / dmth).floor() as i64
-            } else {
-                0
-            };
+            let b = if let Some(dmth) = dm_thresh { (c.dm / dmth).floor() as i64 } else { 0 };
             bins.entry(b).or_default().push(i);
         }
-        let results: Vec<(usize, Vec<usize>)> = bins.into_par_iter().flat_map(|(_, idxs)| {
-            idxs.iter().map(|&i| {
-                let mut rels = Vec::new();
-                for &j in &idxs {
-                    if j > i && cands[i].is_related(&cands[j], period_thresh, dm_thresh, tobs_over_c) {
-                        rels.push(j);
-                    }
-                }
-                (i, rels)
-            }).collect::<Vec<_>>()
-        }).collect();
-        for (i, rels) in results {
-            cands[i].related = rels;
-        }
+        let results: Vec<(usize, Vec<usize>)> = bins
+            .into_par_iter()
+            .flat_map(|(_, idxs)| idxs.iter().map(|&i| { let mut rels = Vec::new(); for &j in &idxs { if j > i && cands[i].is_related(&cands[j], period_thresh, dm_thresh, tobs_over_c) { rels.push(j); } } (i, rels) }).collect::<Vec<_>>())
+            .collect();
+        for (i, rels) in results { cands[i].related = rels; }
     } else {
-        let results: Vec<(usize, Vec<usize>)> = (0..n).into_par_iter().map(|i| {
-            let mut rels = Vec::new();
-            for j in (i+1)..n {
-                if cands[i].is_related(&cands[j], period_thresh, dm_thresh, tobs_over_c) {
-                    rels.push(j);
-                }
-            }
-            (i, rels)
-        }).collect();
-        for (i, rels) in results {
-            cands[i].related = rels;
-        }
+        let results: Vec<(usize, Vec<usize>)> = (0..n).into_par_iter().map(|i| { let mut rels = Vec::new(); for j in (i + 1)..n { if cands[i].is_related(&cands[j], period_thresh, dm_thresh, tobs_over_c) { rels.push(j); } } (i, rels) }).collect();
+        for (i, rels) in results { cands[i].related = rels; }
     }
     println!("[INFO] Finished clustering.");
 }
@@ -290,11 +189,13 @@ fn shortlist_candidates(
     birdies: Option<&[Birdie]>,
     birdie_harmonics: u32,
     scale_birdie_width: bool,
-    ) -> Vec<usize> {
-    println!("[INFO] Shortlisting pivots...");
-    let mut to_remove: std::collections::HashSet<usize> = std::collections::HashSet::new();
+) -> Vec<usize> {
+    use std::collections::HashSet;
 
-    // 1) clustering-based pruning: keep a single pivot per related group
+    println!("[INFO] Shortlisting pivots...");
+    let mut to_remove: HashSet<usize> = HashSet::new();
+
+    // 1) Remove related candidates (keep the "pivot" i)
     for i in 0..cands.len() {
         if cands[i].related.len() > 1 {
             for &r in &cands[i].related {
@@ -303,16 +204,16 @@ fn shortlist_candidates(
         }
     }
 
-    // 2) Birdie + harmonic pruning
+    // 2) Birdie / RFI pruning
     if let Some(birds) = birdies {
         let windows = build_birdie_windows(birds, birdie_harmonics, scale_birdie_width);
         let mut rfi_hits = 0usize;
 
         'cand: for i in 0..cands.len() {
-            if to_remove.contains(&i) { continue; }
-            let f0 = cands[i].f0; // Hz
-
-            // Simple scan is fine for modest window counts
+            if to_remove.contains(&i) {
+                continue;
+            }
+            let f0 = cands[i].f0;
             for &(lo, hi) in &windows {
                 if f0 >= lo && f0 <= hi {
                     to_remove.insert(i);
@@ -323,12 +224,12 @@ fn shortlist_candidates(
         }
 
         println!(
-            "[INFO] Birdie pruning (with harmonics up to k={}) removed {} candidates.",
+            "[INFO] Birdie pruning (k<= {}) removed {} candidates.",
             birdie_harmonics, rfi_hits
         );
     }
 
-    // Mark remaining as pivots
+    // 3) Everything not removed is a pivot
     let mut pivots = Vec::new();
     for (i, c) in cands.iter_mut().enumerate() {
         if !to_remove.contains(&i) {
@@ -336,81 +237,41 @@ fn shortlist_candidates(
             pivots.push(i);
         }
     }
+
     println!("[INFO] Found {} pivots.", pivots.len());
     pivots
 }
 
+
+
 fn save_candidates_csv(cands: &[Candidate], pivots: &[usize], filename: &str) -> Result<()> {
     println!("[INFO] Writing {filename}");
     let mut wtr = csv::Writer::from_path(filename)?;
-    wtr.write_record(&["snr","period","dm","acc","nh","ddm_count_ratio","ddm_snr_ratio","nassoc",
-        "period_ms","uuid","xml_file","candidate_id","num_related","related_cands"])?;
+    wtr.write_record(&["snr", "period", "dm", "acc", "nh", "ddm_count_ratio", "ddm_snr_ratio", "nassoc", "period_ms", "uuid", "xml_file", "candidate_id", "num_related", "related_cands"])?;
     for &i in pivots {
         let c = &cands[i];
-        let related_ids: Vec<String> = c.related.iter().map(|&j| {
-            cands[j].uuid.clone().unwrap_or_else(|| format!("{}_{}", cands[j].xml_file, cands[j].candidate_id))
-        }).collect();
-        wtr.write_record(&[
-            c.snr.to_string(),
-            format!("{:.17}", c.period),
-            format!("{:.8}", c.dm),
-            c.acc.to_string(),
-            c.nh.to_string(),
-            c.ddm_count_ratio.to_string(),
-            c.ddm_snr_ratio.to_string(),
-            c.nassoc.to_string(),
-            c.period_ms.to_string(),
-            c.uuid.clone().unwrap_or_default(),
-            c.xml_file.clone(),
-            c.candidate_id.to_string(),
-            c.related.len().to_string(),
-            related_ids.join(":"),
-        ])?;
+        let related_ids: Vec<String> = c.related.iter().map(|&j| cands[j].uuid.clone().unwrap_or_else(|| format!("{}_{}", cands[j].xml_file, cands[j].candidate_id))).collect();
+        wtr.write_record(&[c.snr.to_string(), format!("{:.17}", c.period), format!("{:.8}", c.dm), c.acc.to_string(), c.nh.to_string(), c.ddm_count_ratio.to_string(), c.ddm_snr_ratio.to_string(), c.nassoc.to_string(), c.period_ms.to_string(), c.uuid.clone().unwrap_or_default(), c.xml_file.clone(), c.candidate_id.to_string(), c.related.len().to_string(), related_ids.join(":")])?;
     }
     wtr.flush()?;
     Ok(())
 }
 
 fn strip_xml_decl(s: &str) -> &str {
-    // Remove any UTF-8 BOM and leading whitespace
-    let trimmed = s.trim_start_matches(|c: char| c == '\u{feff}' || c.is_whitespace());    // If it starts with an XML declaration, skip it
-    if trimmed.starts_with("<?xml") {
-        // find the end of declaration "?>"
-        if let Some(pos) = trimmed.find("?>") {
-            return trimmed[(pos + 2)..].trim_start();
-        }
-    }
+    let trimmed = s.trim_start_matches(|c: char| c == '\u{feff}' || c.is_whitespace());
+    if trimmed.starts_with("<?xml") { if let Some(pos) = trimmed.find("?>") { return trimmed[(pos + 2)..].trim_start(); } }
     trimmed
 }
 
-fn write_updated_xmls(
-    xf: &XmlFile,
-    _cands: &[Candidate],
-    pivot_map: &HashMap<(String, i32), bool>,
-) -> Result<()> {
-    use std::io::BufRead;
-
-    // --- Preserve the original XML declaration from the first line ---
+fn write_updated_xmls(xf: &XmlFile, _cands: &[Candidate], pivot_map: &HashMap<(String, i32), bool>) -> Result<()> {
     let file = fs::File::open(&xf.filename)?;
     let mut first_line = String::new();
-    {
-        let mut reader = std::io::BufReader::new(&file);
-        reader.read_line(&mut first_line)?;
-    }
-    let xml_decl = if first_line.trim_start().starts_with("<?xml") {
-        first_line.trim().to_string()
-    } else {
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>".to_string()
-    };
-
+    { let mut reader = std::io::BufReader::new(&file); reader.read_line(&mut first_line)?; }
+    let xml_decl = if first_line.trim_start().starts_with("<?xml") { first_line.trim().to_string() } else { "<?xml version=\"1.0\" encoding=\"UTF-8\"?>".to_string() };
     let picked_name = xf.filename.replace(".xml", "_picked.xml");
     let rejected_name = xf.filename.replace(".xml", "_rejected.xml");
-
     let mut base = String::new();
-    base.push_str(&xml_decl);
-    base.push('\n');
-    base.push_str("<peasoup_search>\n");
-
+    base.push_str(&xml_decl); base.push('\n'); base.push_str("<peasoup_search>\n");
     if let Some(s) = &xf.sections.misc_info { base.push_str(strip_xml_decl(s)); base.push('\n'); }
     if let Some(s) = &xf.sections.header_parameters { base.push_str(strip_xml_decl(s)); base.push('\n'); }
     if let Some(s) = &xf.sections.search_parameters { base.push_str(strip_xml_decl(s)); base.push('\n'); }
@@ -418,100 +279,96 @@ fn write_updated_xmls(
     if let Some(s) = &xf.sections.dedispersion_trials { base.push_str(strip_xml_decl(s)); base.push('\n'); }
     if let Some(s) = &xf.sections.acceleration_trials { base.push_str(strip_xml_decl(s)); base.push('\n'); }
     if let Some(s) = &xf.sections.cuda_device_parameters { base.push_str(strip_xml_decl(s)); base.push('\n'); }
-
     let mut picked = base.clone();
     let mut rejected = base.clone();
     picked.push_str("<candidates>\n");
     rejected.push_str("<candidates>\n");
-
     for c in &xf.candidates {
         let is_pivot = *pivot_map.get(&(c.xml_file.clone(), c.candidate_id)).unwrap_or(&false);
-        if is_pivot {
-            picked.push_str(strip_xml_decl(&c.raw_xml));
-            picked.push('\n');
-        } else {
-            rejected.push_str(strip_xml_decl(&c.raw_xml));
-            rejected.push('\n');
-        }
+        if is_pivot { picked.push_str(strip_xml_decl(&c.raw_xml)); picked.push('\n'); } else { rejected.push_str(strip_xml_decl(&c.raw_xml)); rejected.push('\n'); }
     }
-
     picked.push_str("</candidates>\n");
     rejected.push_str("</candidates>\n");
-
-    if let Some(s) = &xf.sections.execution_times {
-        picked.push_str(strip_xml_decl(s));
-        picked.push('\n');
-        rejected.push_str(strip_xml_decl(s));
-        rejected.push('\n');
-    }
-
+    if let Some(s) = &xf.sections.execution_times { picked.push_str(strip_xml_decl(s)); picked.push('\n'); rejected.push_str(strip_xml_decl(s)); rejected.push('\n'); }
     picked.push_str("</peasoup_search>\n");
     rejected.push_str("</peasoup_search>\n");
-
-    fs::write(&picked_name, picked)?;
-    fs::write(&rejected_name, rejected)?;
+    fs::write(&picked_name, picked)?; fs::write(&rejected_name, rejected)?;
     println!("[INFO] Wrote {picked_name} and {rejected_name}");
-
     Ok(())
 }
 
 fn main() -> Result<()> {
-    let matches = Command::new("candy_picker_rs")
+    let m = Command::new("candy_picker_rs")
         .version("0.3.0")
         .arg(Arg::new("period_thresh").short('p').num_args(1).required(true))
         .arg(Arg::new("dm_thresh").short('d').num_args(1))
         .arg(Arg::new("ncpus").short('n').num_args(1).default_value("8"))
-        .arg(Arg::new("bin_dm").long("bin-dm").action(clap::ArgAction::SetTrue))
+        .arg(Arg::new("bin_dm").long("bin-dm").action(ArgAction::SetTrue))
+        .arg(Arg::new("birdies").short('B').long("birdies").num_args(1))
+        .arg(Arg::new("birdie_harmonics").short('H').long("birdie-harmonics").num_args(1).default_value("0"))
+        .arg(Arg::new("scale_birdie_width").long("scale-birdie-width").action(ArgAction::SetTrue))
         .arg(Arg::new("xml_files").num_args(1..).required(true))
-        .arg(Arg::new("birdies").short('B').long("birdies").num_args(1).help("Optional file with 'freq width' pairs (Hz) to prune as RFI"))
-        .arg(Arg::new("birdies_harmonics").long("birdie-harmonics").short('H').num_args(1).value_name("N").default_value("16").help("Max harmonic multiple to reject for each birdie (k=1..N)"))
-        .arg(Arg::new("scale_birdie_width").short('W').long("scale-birdie-width").action(clap::ArgAction::SetTrue).help("Scale the birdie width by k for the k-th harmonic"))
         .get_matches();
 
-    let period_thresh: f64 = matches.get_one::<String>("period_thresh").unwrap().parse()?;
-    let dm_thresh: Option<f64> = matches.get_one::<String>("dm_thresh").map(|s| s.parse().unwrap());
-    let ncpus: usize = matches.get_one::<String>("ncpus").unwrap().parse()?;
-    let bin_dm: bool = matches.get_flag("bin_dm");
-    let xml_files: Vec<String> = matches.get_many::<String>("xml_files").unwrap().map(|s| s.to_string()).collect();
-    let birdies_vec: Option<Vec<Birdie>> = matches.get_one::<String>("birdies").map(|p| parse_birdies(p)).transpose()?; // Option<Result<_>> -> Result<Option<_>>
-    let birdie_harmonics: u32 = matches.get_one::<String>("birdie_harmonics").unwrap().parse()?;
-    let scale_birdie_width: bool = matches.get_flag("scale_birdie_width");
+    let pth: f64 = m.get_one::<String>("period_thresh").ok_or_else(|| anyhow!("missing -p/--period_thresh"))?.parse().map_err(|e| anyhow!("bad -p: {e}"))?;
+    let dmth: Option<f64> = m.get_one::<String>("dm_thresh").and_then(|s| s.parse().ok());
+    let ncpus: usize = m.get_one::<String>("ncpus").and_then(|s| s.parse().ok()).unwrap_or(8);
+    let bin_dm: bool = m.get_flag("bin_dm");
+    let xml_files: Vec<String> = m.get_many::<String>("xml_files").map(|v| v.map(|s| s.to_string()).collect()).unwrap_or_default();
+    if xml_files.is_empty() { return Err(anyhow!("no XML files (shell may not have expanded pattern)")); }
+    let birdies: Option<Vec<Birdie>> = m.get_one::<String>("birdies").map(|p| load_birdies(p)).transpose()?;
+    let bh: u32 = m.get_one::<String>("birdie_harmonics").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let sbw: bool = m.get_flag("scale_birdie_width");
 
-    println!("[INFO] Settings: period_thresh={period_thresh}, dm_thresh={:?}, workers={ncpus}, bin_dm={bin_dm}", dm_thresh);
-    rayon::ThreadPoolBuilder::new().num_threads(ncpus).build_global().unwrap();
+    rayon::ThreadPoolBuilder::new().num_threads(ncpus).build_global().ok();
 
     let mut xml_file_objects = Vec::new();
     let mut all_candidates = Vec::new();
     for f in &xml_files {
-        let xf = parse_xml_file(f)?;
-        all_candidates.extend(xf.candidates.clone());
-        xml_file_objects.push(xf);
+        match parse_xml_file(f) {
+            Ok(xf) => { all_candidates.extend(xf.candidates.clone()); xml_file_objects.push(xf); }
+            Err(e) => { eprintln!("[WARN] Skipping {}: {}", f, e); }
+        }
     }
-    if all_candidates.is_empty() {
-        return Err(anyhow!("No candidates found"));
-    }
+    if all_candidates.is_empty() { return Err(anyhow!("No candidates found in provided XML files")); }
     if xml_file_objects.len() > 1 {
         for xf in &xml_file_objects[1..] {
-            if xf.fft_size != xml_file_objects[0].fft_size || xf.tsamp != xml_file_objects[0].tsamp {
+            if xf.fft_size != xml_file_objects[0].fft_size || (xf.tsamp - xml_file_objects[0].tsamp).abs() > 0.0 {
                 return Err(anyhow!("fft size and tsamp differ across files"));
             }
         }
     }
+    println!("[INFO] Total candidates across all files: {}", all_candidates.len());
+
+
     let effective_tobs = xml_file_objects[0].fft_size as f64 * xml_file_objects[0].tsamp;
     let tobs_over_c = effective_tobs / SPEED_OF_LIGHT;
     println!("[INFO] Effective TOBS: {effective_tobs} s");
 
-    cluster_candidates(&mut all_candidates, period_thresh, dm_thresh, tobs_over_c, bin_dm);
-    let pivots = shortlist_candidates(&mut all_candidates, birdies_vec.as_deref(), birdie_harmonics, scale_birdie_width,);
+    println!("[INFO] Sorting candidates by SNR (descending) before clustering...");
+    all_candidates.sort_by(|a, b| {
+        b.snr
+            .partial_cmp(&a.snr)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    cluster_candidates(&mut all_candidates, pth, dmth, tobs_over_c, bin_dm);
+    let pivots = shortlist_candidates(&mut all_candidates, birdies.as_deref(), bh, sbw);
+    let mut pivots_by_file: HashMap<&str, usize> = HashMap::new();
+    for &i in &pivots {
+        let f = &all_candidates[i].xml_file;
+        *pivots_by_file.entry(f.as_str()).or_insert(0) += 1;
+    }
+    for (f, cnt) in pivots_by_file {
+        println!("[INFO] Pivots from {f}: {cnt}");
+    }
+
     save_candidates_csv(&all_candidates, &pivots, "pivots.csv")?;
 
-    let mut pivot_map: HashMap<(String,i32), bool> = HashMap::new();
-    for &i in &pivots {
-        pivot_map.insert((all_candidates[i].xml_file.clone(), all_candidates[i].candidate_id), true);
-    }
-    for xf in &xml_file_objects {
-        write_updated_xmls(xf, &all_candidates, &pivot_map)?;
-    }
+    let mut pivot_map: HashMap<(String, i32), bool> = HashMap::new();
+    for &i in &pivots { pivot_map.insert((all_candidates[i].xml_file.clone(), all_candidates[i].candidate_id), true); }
+    for xf in &xml_file_objects { write_updated_xmls(xf, &all_candidates, &pivot_map)?; }
+
     println!("[INFO] All done.");
     Ok(())
 }
