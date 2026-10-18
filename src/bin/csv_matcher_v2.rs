@@ -68,6 +68,13 @@ fn extract_acc(hmap: &HashMap<String, usize>, row: &StringRecord) -> Option<f64>
     find_col(hmap, &a_cols).and_then(|idx| row.get(idx).and_then(parse_f64_opt))
 }
 
+/// Candidate S/N: prefer the folded S/N, fall back to the search (FFT) S/N.
+const SNR_COLS: [&str; 7] = ["sn_fold", "snr", "fold_snr", "sn", "s/n", "sigma", "sn_fft"];
+
+fn extract_snr(hmap: &HashMap<String, usize>, row: &StringRecord) -> Option<f64> {
+    find_col(hmap, &SNR_COLS).and_then(|idx| row.get(idx).and_then(parse_f64_opt))
+}
+
 /// PNG/plot path passthrough, kept as a string (not numeric).
 fn extract_png(hmap: &HashMap<String, usize>, row: &StringRecord) -> Option<String> {
     let png_cols = ["png_path", "png_file", "pngfile", "png", "plot_file", "plot", "filename"];
@@ -89,6 +96,7 @@ struct RowRef {
     period: Option<f64>,
     dm: Option<f64>,
     acc: Option<f64>,
+    snr: Option<f64>,
     png: Option<String>,
 }
 
@@ -369,6 +377,13 @@ fn main() -> Result<()> {
                 .help("Suffix appended to each input filename for its matched output."),
         )
         .arg(
+            Arg::new("extra_cols")
+                .long("extra-cols")
+                .num_args(1)
+                .required(false)
+                .help("Comma-separated input columns to copy into the pairs table as <col>_a / <col>_b, e.g. sn_fft,tobs. snr_a / snr_b and every pics* classifier score column are always written."),
+        )
+        .arg(
             Arg::new("pairs_out")
                 .long("pairs-out")
                 .num_args(1)
@@ -424,6 +439,15 @@ fn main() -> Result<()> {
 
     let out_suffix = matches.get_one::<String>("out_suffix").unwrap();
     let pairs_out = matches.get_one::<String>("pairs_out").unwrap();
+    let extra_cols: Vec<String> = matches
+        .get_one::<String>("extra_cols")
+        .map(|s| {
+            s.split(',')
+                .map(|c| c.trim().to_string())
+                .filter(|c| !c.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
 
     if inputs.len() < 2 {
         return Err(anyhow!(
@@ -437,7 +461,30 @@ fn main() -> Result<()> {
         let path = Path::new(p);
         let fd = read_csv(path)?;
         println!("[INFO] Loaded {} rows from {}", fd.rows.len(), path.display());
+        if find_col(&fd.hmap, &SNR_COLS).is_none() {
+            println!(
+                "[WARN] No S/N column ({}) in {}; snr will be NA for its rows",
+                SNR_COLS.join(", "),
+                path.display()
+            );
+        }
+        for c in &extra_cols {
+            if find_col(&fd.hmap, &[c.as_str()]).is_none() {
+                println!("[WARN] --extra-cols: no column '{}' in {}; it will be NA", c, path.display());
+            }
+        }
         files.push(fd);
+    }
+
+    // Columns copied verbatim into the pairs table: the requested extras plus every PICS score column.
+    let mut copied_cols: Vec<String> = extra_cols.iter().map(|c| c.to_ascii_lowercase()).collect();
+    for f in &files {
+        for name in f.header.iter() {
+            let name = name.trim().trim_start_matches('#').to_ascii_lowercase();
+            if name.starts_with("pics") && !copied_cols.contains(&name) {
+                copied_cols.push(name);
+            }
+        }
     }
 
     // Build global list of row refs.
@@ -450,6 +497,7 @@ fn main() -> Result<()> {
                 period: extract_period(&f.hmap, rec),
                 dm: extract_dm(&f.hmap, rec),
                 acc: extract_acc(&f.hmap, rec),
+                snr: extract_snr(&f.hmap, rec),
                 png: extract_png(&f.hmap, rec),
             });
         }
@@ -589,25 +637,43 @@ fn main() -> Result<()> {
         let mut w = WriterBuilder::new()
             .from_path(pairs_out)
             .with_context(|| format!("creating {}", pairs_out))?;
-        w.write_record([
-            "match_group",
-            "file_a",
-            "row_a",
-            "period_a",
-            "dm_a",
-            "acc_a",
-            "png_a",
-            "file_b",
-            "row_b",
-            "period_b",
-            "dm_b",
-            "acc_b",
-            "png_b",
-            "match_type",
-            "harmonic_k",
-            "period_frac_diff",
-            "period_diff_s",
-        ])?;
+        let mut header_out: Vec<String> = vec!["match_group".to_string()];
+        for side in ["a", "b"] {
+            for col in ["file", "row", "period", "dm", "acc", "snr"] {
+                header_out.push(format!("{}_{}", col, side));
+            }
+            for col in &copied_cols {
+                header_out.push(format!("{}_{}", col, side));
+            }
+            header_out.push(format!("png_{}", side));
+        }
+        for col in ["match_type", "harmonic_k", "period_frac_diff", "period_diff_s"] {
+            header_out.push(col.to_string());
+        }
+        w.write_record(&header_out)?;
+
+        // The values of one candidate, in the same order as its half of header_out.
+        let side_values = |rr: &RowRef| -> Vec<String> {
+            let f = &files[rr.file_id];
+            let mut v = vec![
+                f.path.file_name().unwrap().to_string_lossy().to_string(),
+                (rr.row_idx + 1).to_string(), // 1-based data row number in the ORIGINAL input file
+                format!("{}", rr.period.unwrap()),
+                fmt_opt(rr.dm),
+                fmt_opt(rr.acc),
+                fmt_opt(rr.snr),
+            ];
+            for col in &copied_cols {
+                let value = find_col(&f.hmap, &[col.as_str()])
+                    .and_then(|idx| f.rows[rr.row_idx].get(idx))
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty());
+                v.push(value.unwrap_or("NA").to_string());
+            }
+            v.push(rr.png.clone().unwrap_or_else(|| "NA".to_string()));
+            v
+        };
+
         for p in &pairs {
             let ra = &all_rows[p.gidx_a];
             let rb = &all_rows[p.gidx_b];
@@ -617,25 +683,14 @@ fn main() -> Result<()> {
                 .unwrap_or_default();
             let pa = ra.period.unwrap();
             let pb = rb.period.unwrap();
-            w.write_record([
-                gid.to_string(),
-                files[ra.file_id].path.file_name().unwrap().to_string_lossy().to_string(),
-                (ra.row_idx + 1).to_string(), // 1-based data row number in the ORIGINAL input file
-                format!("{}", pa),
-                fmt_opt(ra.dm),
-                fmt_opt(ra.acc),
-                ra.png.clone().unwrap_or_else(|| "NA".to_string()),
-                files[rb.file_id].path.file_name().unwrap().to_string_lossy().to_string(),
-                (rb.row_idx + 1).to_string(),
-                format!("{}", pb),
-                fmt_opt(rb.dm),
-                fmt_opt(rb.acc),
-                rb.png.clone().unwrap_or_else(|| "NA".to_string()),
-                p.kind.label(),
-                p.kind.k().to_string(),
-                format!("{}", p.frac_diff), // the actual criterion value: |compared_a - compared_b| / mean, accounting for k
-                format!("{}", (pa - pb).abs()), // raw |Pa-Pb| in seconds, NOT harmonic-corrected -- informational only
-            ])?;
+            let mut rec = vec![gid.to_string()];
+            rec.extend(side_values(ra));
+            rec.extend(side_values(rb));
+            rec.push(p.kind.label());
+            rec.push(p.kind.k().to_string());
+            rec.push(format!("{}", p.frac_diff)); // the actual criterion value: |compared_a - compared_b| / mean, accounting for k
+            rec.push(format!("{}", (pa - pb).abs())); // raw |Pa-Pb| in seconds, NOT harmonic-corrected -- informational only
+            w.write_record(&rec)?;
         }
         w.flush()?;
         println!(
