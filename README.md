@@ -97,6 +97,9 @@ Options:
   --acctol <tol>            Absolute acceleration tolerance (optional)
   --harmonics               Also match harmonics (k*P and P/k)
   --hmax <k>                Largest harmonic k with --harmonics [default: 8]
+  --bary                    Match on barycentric (demodulated) periods instead of topocentric ones
+  --site-lat <deg>          Telescope latitude for --bary / period_demod [default: -30.71292, MeerKAT]
+  --site-lon <deg>          Telescope east longitude [default: 21.44380, MeerKAT]
   --extra-cols <cols>       Comma-separated extra columns to copy into the pairs table
   --out-suffix <suffix>     Suffix for the per-file outputs [default: _matched.csv]
   --pairs-out <file>        Pairs table [default: matched_pairs.csv]
@@ -107,7 +110,13 @@ Example:
 csv_matcher_v2 -i M79_02_candidates.csv M79_03_seg2_candidates.csv --ptol-frac 1e-4 --dmtol 1 --pairs-out M79_matches.csv
 ```
 
-Period is read from `p0_new`/`period`/`p0`/... or computed as 1/`f0_opt`; DM from `dm_new`/`dm_opt`/`dm`; acceleration from `acc_new`/`acc_opt`/`acc`; the plot from `png_path`/`png_file`/`png`/...
+Period is read from `p0_new`/`period`/`p0`/... or computed as 1/`f0_opt`; DM from `dm_new`/`dm_opt`/`dm`; acceleration from `acc_new`/`acc_opt`/`acc`; the plot from `png_path`/`png_file`/`png`/...; position from `ra`/`dec` (hh:mm:ss / dd:mm:ss or degrees); the epoch from `pepoch` (else the middle of the observation from `mjd_start` + `tobs`/2).
+
+### Barycentric (demodulated) periods
+
+Candidate periods from a search are topocentric, so Earth's orbital motion shifts the same pulsar's period by up to ~1e-4 between observations months apart. For every candidate with a position and an epoch, the matcher also computes the barycentric period `period_demod` = P (1 + v/c), where v is the velocity of the telescope towards the source (Earth's orbit plus its rotation at the telescope, MeerKAT by default) at the epoch. This agrees with astropy's barycentric correction to ~0.01 km/s, i.e. ~1e-7 in P.
+
+A real pulsar keeps the same `period_demod` in every observation, so with `--bary` the match is made on barycentric periods and `--ptol-frac` can be much tighter (e.g. 1e-6 for an isolated pulsar; binaries still change by v_orbit/c).
 
 This will produce:
 - `<input>_matched.csv` for each input: only its matched rows, with all original columns plus `match_group`
@@ -125,7 +134,12 @@ This will produce:
 | `pics_*_a`, `pics_*_b` | Every PICS score column found in the inputs; `NA` where a file lacks it |
 | `<col>_a`, `<col>_b` | Any columns requested with `--extra-cols` |
 | `match_type`, `harmonic_k` | `direct`, or `a=kx*b` / `b=kx*a` for harmonic matches, and k |
-| `period_frac_diff` | The value tested against `--ptol-frac` (harmonic-corrected) |
-| `period_diff_s` | Raw abs(Pa-Pb) in seconds (not harmonic-corrected) |
+| `period_demod_*`, `tobs_*`, `epoch_mjd_*`, `ra_*`, `dec_*` | Barycentric period (s), observation length, epoch the period refers to, and position of each candidate |
+| `period_frac_diff` | The value tested against `--ptol-frac` (harmonic-corrected; on barycentric periods with `--bary`) |
+| `period_diff_s` | Raw abs(Pa-Pb) in seconds (topocentric, not harmonic-corrected) |
+| `period_demod_frac_diff` | Fractional difference of the barycentric periods (harmonic-corrected); stays ~0 for a real pulsar |
+| `dv_kms` | Line-of-sight velocity change implied by the period change, c (Pb - Pa) / Pa (harmonic-corrected), from the barycentric periods when available |
+| `dv_frame` | `barycentric` or `topocentric`: which periods `dv_kms` comes from. A topocentric dV also contains the change in Earth's velocity towards the source (up to ~60 km/s between observations months apart) |
+| `ang_sep_arcsec` | Angular distance between the two candidates' positions |
 
 The pairs table can be viewed side by side in the CandyJar match viewer (`-m`, see https://github.com/wintervolcano/CandyJar).

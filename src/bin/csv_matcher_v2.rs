@@ -75,6 +75,109 @@ fn extract_snr(hmap: &HashMap<String, usize>, row: &StringRecord) -> Option<f64>
     find_col(hmap, &SNR_COLS).and_then(|idx| row.get(idx).and_then(parse_f64_opt))
 }
 
+fn extract_str(hmap: &HashMap<String, usize>, row: &StringRecord, cols: &[&str]) -> Option<String> {
+    find_col(hmap, cols).and_then(|idx| {
+        let v = row.get(idx)?.trim();
+        if v.is_empty() || v.eq_ignore_ascii_case("nan") {
+            None
+        } else {
+            Some(v.to_string())
+        }
+    })
+}
+
+fn extract_f64(hmap: &HashMap<String, usize>, row: &StringRecord, cols: &[&str]) -> Option<f64> {
+    find_col(hmap, cols).and_then(|idx| row.get(idx).and_then(parse_f64_opt))
+}
+
+const RA_COLS: [&str; 4] = ["ra", "raj", "ra_hms", "ra_deg"];
+const DEC_COLS: [&str; 4] = ["dec", "decj", "dec_dms", "dec_deg"];
+const TOBS_COLS: [&str; 3] = ["tobs", "t_obs", "tobs_s"];
+const MJD_START_COLS: [&str; 3] = ["mjd_start", "mjd", "tstart"];
+const PEPOCH_COLS: [&str; 2] = ["pepoch", "epoch"];
+
+/// Speed of light in km/s.
+const C_KMS: f64 = 299_792.458;
+
+/// RA ("hh:mm:ss.s" or degrees) to degrees.
+fn parse_ra_deg(s: &str) -> Option<f64> {
+    if s.contains(':') {
+        parse_sexagesimal(s).map(|h| h * 15.0)
+    } else {
+        s.trim().parse::<f64>().ok()
+    }
+}
+
+/// DEC ("+dd:mm:ss.s" or degrees) to degrees.
+fn parse_dec_deg(s: &str) -> Option<f64> {
+    if s.contains(':') {
+        parse_sexagesimal(s)
+    } else {
+        s.trim().parse::<f64>().ok()
+    }
+}
+
+/// "a:b:c" -> a + b/60 + c/3600, keeping the sign of a (also for "-00:..").
+fn parse_sexagesimal(s: &str) -> Option<f64> {
+    let t = s.trim();
+    let negative = t.starts_with('-');
+    let mut total = 0.0;
+    for (i, part) in t.trim_start_matches(['+', '-']).split(':').enumerate() {
+        if i > 2 {
+            return None;
+        }
+        total += part.trim().parse::<f64>().ok()? / 60f64.powi(i as i32);
+    }
+    Some(if negative { -total } else { total })
+}
+
+/// Angular separation of two sky positions (degrees in, arcsec out), haversine form.
+fn ang_sep_arcsec(ra1: f64, dec1: f64, ra2: f64, dec2: f64) -> f64 {
+    let (ra1, dec1, ra2, dec2) = (ra1.to_radians(), dec1.to_radians(), ra2.to_radians(), dec2.to_radians());
+    let h = ((dec2 - dec1) / 2.0).sin().powi(2) + dec1.cos() * dec2.cos() * ((ra2 - ra1) / 2.0).sin().powi(2);
+    2.0 * h.sqrt().min(1.0).asin().to_degrees() * 3600.0
+}
+
+/// Velocity of the observer towards the source (km/s; positive = approaching), from Earth's
+/// orbital motion (Keplerian orbit with low-precision solar elements, Meeus ch. 25) plus Earth's
+/// rotation at the telescope. RA/DEC are J2000 degrees, `mjd` is UTC. It leaves out the Earth-Moon
+/// and Sun-barycentre wobbles, so it agrees with astropy's barycentric correction to ~0.01 km/s rms
+/// (0.03 km/s worst case, i.e. 1e-7 in P), far below any useful matching tolerance.
+fn observer_velocity_towards_kms(ra_deg: f64, dec_deg: f64, mjd: f64, site_lat_deg: f64, site_lon_deg: f64) -> f64 {
+    let d = mjd + 2_400_000.5 - 2_451_545.0; // days since J2000.0
+    let t = d / 36_525.0;
+    let mean_anomaly = (357.52911 + 35_999.05029 * t - 0.0001537 * t * t).to_radians();
+    let ecc = 0.016708634 - 0.000042037 * t - 0.0000001267 * t * t;
+    let centre = (1.914602 - 0.004817 * t - 0.000014 * t * t) * mean_anomaly.sin()
+        + (0.019993 - 0.000101 * t) * (2.0 * mean_anomaly).sin()
+        + 0.000289 * (3.0 * mean_anomaly).sin();
+    let sun_longitude_of_date = 280.46646 + 36_000.76983 * t + 0.0003032 * t * t + centre;
+    // refer longitudes to the J2000 equinox, so they match J2000 source coordinates
+    let precession = 1.396971 * t;
+    let earth_longitude = (sun_longitude_of_date + 180.0 - precession).to_radians();
+    let perihelion = (102.93735 + 0.32327 * t).to_radians();
+
+    // Keplerian orbital velocity in J2000 ecliptic coordinates
+    let mu_sun = 1.327_124_400_18e11; // km^3/s^2
+    let au = 1.495_978_707e8; // km
+    let speed = (mu_sun / (au * (1.0 - ecc * ecc))).sqrt();
+    let vx = -speed * (earth_longitude.sin() + ecc * perihelion.sin());
+    let vy = speed * (earth_longitude.cos() + ecc * perihelion.cos());
+    let obliquity = 23.439_291_1f64.to_radians();
+    let (v_eq_x, v_eq_y, v_eq_z) = (vx, vy * obliquity.cos(), vy * obliquity.sin());
+
+    let (ra, dec) = (ra_deg.to_radians(), dec_deg.to_radians());
+    let orbital = v_eq_x * dec.cos() * ra.cos() + v_eq_y * dec.cos() * ra.sin() + v_eq_z * dec.sin();
+
+    // Earth rotation: the site moves east at omega * R * cos(lat); towards the source this is -cos(dec) sin(hour angle)
+    let gmst_deg = 280.460_618_37 + 360.985_647_366_29 * d;
+    let hour_angle = (gmst_deg + site_lon_deg).to_radians() - ra;
+    let rotation_speed = 7.292_115_9e-5 * 6378.137 * site_lat_deg.to_radians().cos();
+    let rotation = -rotation_speed * dec.cos() * hour_angle.sin();
+
+    orbital + rotation
+}
+
 /// PNG/plot path passthrough, kept as a string (not numeric).
 fn extract_png(hmap: &HashMap<String, usize>, row: &StringRecord) -> Option<String> {
     let png_cols = ["png_path", "png_file", "pngfile", "png", "plot_file", "plot", "filename"];
@@ -94,9 +197,20 @@ struct RowRef {
     file_id: usize,
     row_idx: usize,
     period: Option<f64>,
+    /// Barycentric ("demodulated") period: Earth's motion towards the source removed.
+    period_bary: Option<f64>,
+    /// The period used for matching: period_bary with --bary (when it can be computed), else period.
+    match_period: Option<f64>,
     dm: Option<f64>,
     acc: Option<f64>,
     snr: Option<f64>,
+    tobs: Option<f64>,
+    /// Epoch the period refers to (MJD): pepoch, else the middle of the observation, else its start.
+    epoch: Option<f64>,
+    ra: Option<String>,
+    dec: Option<String>,
+    ra_deg: Option<f64>,
+    dec_deg: Option<f64>,
     png: Option<String>,
 }
 
@@ -218,6 +332,15 @@ impl MatchKind {
             MatchKind::Direct => 1,
             MatchKind::AisKTimesB(k) | MatchKind::BisKTimesA(k) => *k,
         }
+    }
+}
+
+/// The two periods as they are compared for a match of this kind (the shorter one multiplied by k).
+fn harmonic_pair(kind: MatchKind, pa: f64, pb: f64) -> (f64, f64) {
+    match kind {
+        MatchKind::Direct => (pa, pb),
+        MatchKind::AisKTimesB(k) => (pa, k as f64 * pb),
+        MatchKind::BisKTimesA(k) => (k as f64 * pa, pb),
     }
 }
 
@@ -384,6 +507,28 @@ fn main() -> Result<()> {
                 .help("Comma-separated input columns to copy into the pairs table as <col>_a / <col>_b, e.g. sn_fft,tobs. snr_a / snr_b and every pics* classifier score column are always written."),
         )
         .arg(
+            Arg::new("bary")
+                .long("bary")
+                .action(ArgAction::SetTrue)
+                .help("Match on barycentric (demodulated) periods instead of topocentric ones, where RA/DEC and an epoch are available. Earth's motion no longer shifts the period between observations, so --ptol-frac can be much tighter."),
+        )
+        .arg(
+            Arg::new("site_lat")
+                .long("site-lat")
+                .num_args(1)
+                .allow_hyphen_values(true)
+                .default_value("-30.71292")
+                .help("Telescope latitude in degrees, for Earth-rotation in the barycentric period (default: MeerKAT)."),
+        )
+        .arg(
+            Arg::new("site_lon")
+                .long("site-lon")
+                .num_args(1)
+                .allow_hyphen_values(true)
+                .default_value("21.44380")
+                .help("Telescope east longitude in degrees (default: MeerKAT)."),
+        )
+        .arg(
             Arg::new("pairs_out")
                 .long("pairs-out")
                 .num_args(1)
@@ -439,6 +584,17 @@ fn main() -> Result<()> {
 
     let out_suffix = matches.get_one::<String>("out_suffix").unwrap();
     let pairs_out = matches.get_one::<String>("pairs_out").unwrap();
+    let bary = matches.get_flag("bary");
+    let site_lat: f64 = matches
+        .get_one::<String>("site_lat")
+        .unwrap()
+        .parse()
+        .context("parsing --site-lat")?;
+    let site_lon: f64 = matches
+        .get_one::<String>("site_lon")
+        .unwrap()
+        .parse()
+        .context("parsing --site-lon")?;
     let extra_cols: Vec<String> = matches
         .get_one::<String>("extra_cols")
         .map(|s| {
@@ -468,6 +624,24 @@ fn main() -> Result<()> {
                 path.display()
             );
         }
+        let mut missing = Vec::new();
+        if find_col(&fd.hmap, &RA_COLS).is_none() {
+            missing.push("RA");
+        }
+        if find_col(&fd.hmap, &DEC_COLS).is_none() {
+            missing.push("DEC");
+        }
+        if find_col(&fd.hmap, &PEPOCH_COLS).is_none() && find_col(&fd.hmap, &MJD_START_COLS).is_none() {
+            missing.push("pepoch/mjd_start");
+        }
+        if !missing.is_empty() {
+            println!(
+                "[WARN] No {} column in {}; period_demod and angular separation will be NA for its rows{}",
+                missing.join(", "),
+                path.display(),
+                if bary { " and it is matched on topocentric periods" } else { "" }
+            );
+        }
         for c in &extra_cols {
             if find_col(&fd.hmap, &[c.as_str()]).is_none() {
                 println!("[WARN] --extra-cols: no column '{}' in {}; it will be NA", c, path.display());
@@ -491,13 +665,40 @@ fn main() -> Result<()> {
     let mut all_rows = Vec::<RowRef>::new();
     for (fid, f) in files.iter().enumerate() {
         for (idx, rec) in f.rows.iter().enumerate() {
+            let period = extract_period(&f.hmap, rec);
+            let tobs = extract_f64(&f.hmap, rec, &TOBS_COLS);
+            let mjd_start = extract_f64(&f.hmap, rec, &MJD_START_COLS);
+            let epoch = extract_f64(&f.hmap, rec, &PEPOCH_COLS).or_else(|| match (mjd_start, tobs) {
+                (Some(m), Some(t)) => Some(m + t / 2.0 / 86_400.0),
+                (Some(m), None) => Some(m),
+                _ => None,
+            });
+            let ra = extract_str(&f.hmap, rec, &RA_COLS);
+            let dec = extract_str(&f.hmap, rec, &DEC_COLS);
+            let ra_deg = ra.as_deref().and_then(parse_ra_deg);
+            let dec_deg = dec.as_deref().and_then(parse_dec_deg);
+            // topocentric P = P_bary / (1 + v/c) for an observer approaching the source at v
+            let period_bary = match (period, ra_deg, dec_deg, epoch) {
+                (Some(p), Some(r), Some(d), Some(e)) => {
+                    Some(p * (1.0 + observer_velocity_towards_kms(r, d, e, site_lat, site_lon) / C_KMS))
+                }
+                _ => None,
+            };
             all_rows.push(RowRef {
                 file_id: fid,
                 row_idx: idx,
-                period: extract_period(&f.hmap, rec),
+                period,
+                period_bary,
+                match_period: if bary { period_bary.or(period) } else { period },
                 dm: extract_dm(&f.hmap, rec),
                 acc: extract_acc(&f.hmap, rec),
                 snr: extract_snr(&f.hmap, rec),
+                tobs,
+                epoch,
+                ra,
+                dec,
+                ra_deg,
+                dec_deg,
                 png: extract_png(&f.hmap, rec),
             });
         }
@@ -506,7 +707,7 @@ fn main() -> Result<()> {
     // Bucket index: bucket -> list of global indices
     let mut buckets: HashMap<i64, Vec<usize>> = HashMap::new();
     for (gidx, rr) in all_rows.iter().enumerate() {
-        if let Some(p) = rr.period {
+        if let Some(p) = rr.match_period {
             let b = log_bucket(p, bin_width);
             buckets.entry(b).or_default().push(gidx);
         }
@@ -517,7 +718,7 @@ fn main() -> Result<()> {
     let mut seen_pairs: HashSet<(usize, usize)> = HashSet::new();
 
     for (gidx, rr) in all_rows.iter().enumerate() {
-        let Some(p1) = rr.period else { continue };
+        let Some(p1) = rr.match_period else { continue };
         let neigh = candidate_buckets(p1, ptol_frac, harmonics, hmax, bin_width);
         for nb in neigh {
             let Some(list) = buckets.get(&nb) else { continue };
@@ -529,7 +730,7 @@ fn main() -> Result<()> {
                 if oo.file_id == rr.file_id {
                     continue; // only across files
                 }
-                let Some(p2) = oo.period else { continue };
+                let Some(p2) = oo.match_period else { continue };
 
                 let Some((kind, d)) = classify_period_match(p1, p2, ptol_frac, harmonics, hmax)
                 else {
@@ -639,7 +840,7 @@ fn main() -> Result<()> {
             .with_context(|| format!("creating {}", pairs_out))?;
         let mut header_out: Vec<String> = vec!["match_group".to_string()];
         for side in ["a", "b"] {
-            for col in ["file", "row", "period", "dm", "acc", "snr"] {
+            for col in ["file", "row", "period", "period_demod", "dm", "acc", "snr", "tobs", "epoch_mjd", "ra", "dec"] {
                 header_out.push(format!("{}_{}", col, side));
             }
             for col in &copied_cols {
@@ -647,7 +848,16 @@ fn main() -> Result<()> {
             }
             header_out.push(format!("png_{}", side));
         }
-        for col in ["match_type", "harmonic_k", "period_frac_diff", "period_diff_s"] {
+        for col in [
+            "match_type",
+            "harmonic_k",
+            "period_frac_diff",
+            "period_diff_s",
+            "period_demod_frac_diff",
+            "dv_kms",
+            "dv_frame",
+            "ang_sep_arcsec",
+        ] {
             header_out.push(col.to_string());
         }
         w.write_record(&header_out)?;
@@ -659,9 +869,14 @@ fn main() -> Result<()> {
                 f.path.file_name().unwrap().to_string_lossy().to_string(),
                 (rr.row_idx + 1).to_string(), // 1-based data row number in the ORIGINAL input file
                 format!("{}", rr.period.unwrap()),
+                fmt_opt(rr.period_bary),
                 fmt_opt(rr.dm),
                 fmt_opt(rr.acc),
                 fmt_opt(rr.snr),
+                fmt_opt(rr.tobs),
+                fmt_opt(rr.epoch),
+                rr.ra.clone().unwrap_or_else(|| "NA".to_string()),
+                rr.dec.clone().unwrap_or_else(|| "NA".to_string()),
             ];
             for col in &copied_cols {
                 let value = find_col(&f.hmap, &[col.as_str()])
@@ -690,6 +905,24 @@ fn main() -> Result<()> {
             rec.push(p.kind.k().to_string());
             rec.push(format!("{}", p.frac_diff)); // the actual criterion value: |compared_a - compared_b| / mean, accounting for k
             rec.push(format!("{}", (pa - pb).abs())); // raw |Pa-Pb| in seconds, NOT harmonic-corrected -- informational only
+
+            // Barycentric comparison, harmonic-corrected the same way as the match: these stay ~0 for a real pulsar
+            let (bary_a, bary_b) = (ra.period_bary, rb.period_bary);
+            let demod_diff = match (bary_a, bary_b) {
+                (Some(a), Some(b)) => Some(harmonic_pair(p.kind, a, b)),
+                _ => None,
+            };
+            rec.push(fmt_opt(demod_diff.map(|(a, b)| frac_diff(a, b))));
+            // line-of-sight velocity change implied by the period change: dV = c (Pb - Pa) / Pa (barycentric when available)
+            let (va, vb) = demod_diff.unwrap_or_else(|| harmonic_pair(p.kind, pa, pb));
+            rec.push(format!("{}", C_KMS * (vb - va) / va));
+            // topocentric dV still contains the change in Earth's velocity towards the source
+            rec.push(if demod_diff.is_some() { "barycentric" } else { "topocentric" }.to_string());
+            let sep = match (ra.ra_deg, ra.dec_deg, rb.ra_deg, rb.dec_deg) {
+                (Some(r1), Some(d1), Some(r2), Some(d2)) => Some(ang_sep_arcsec(r1, d1, r2, d2)),
+                _ => None,
+            };
+            rec.push(fmt_opt(sep));
             w.write_record(&rec)?;
         }
         w.flush()?;
