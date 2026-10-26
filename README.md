@@ -23,8 +23,8 @@ This is a rebuild of https://github.com/erc-compact/CandyPicker/tree/main by viv
 Clone the repository:
 
 ```bash
-git clone https://github.com/yourusername/candy_picker_rs.git
-cd candy_picker_rs
+git clone https://github.com/wintervolcano/rusty_candypicker.git
+cd rusty_candypicker
 ```
 
 ### Build in release mode:
@@ -102,6 +102,7 @@ Options:
   --site-lon <deg>          Telescope east longitude [default: 21.44380, MeerKAT]
   --extra-cols <cols>       Comma-separated extra columns to copy into the pairs table
   --out-suffix <suffix>     Suffix for the per-file outputs [default: _matched.csv]
+  --pairs-only              Only write the pairs table, not the per-file outputs
   --pairs-out <file>        Pairs table [default: matched_pairs.csv]
 ```
 
@@ -128,6 +129,7 @@ This will produce:
 |---|---|
 | `match_group` | Candidates linked by any chain of matches across files share a group number (A1 matches B1 and B1 matches A5: all three are in one group) |
 | `file_a`, `file_b` | The candidate files the two candidates come from |
+| `path_a`, `path_b` | Full paths of those files; relative `png_*` paths are relative to their directories |
 | `row_a`, `row_b` | 1-based data row of the candidate in its file (header not counted) |
 | `period_*`, `dm_*`, `acc_*`, `png_*` | Period (s), DM, acceleration and plot path of each candidate |
 | `snr_*` | S/N, from `sn_fold` (falling back to `snr`, `sigma`, ... `sn_fft`); `NA` if the file has none |
@@ -142,4 +144,4 @@ This will produce:
 | `dv_frame` | `barycentric` or `topocentric`: which periods `dv_kms` comes from. A topocentric dV also contains the change in Earth's velocity towards the source (up to ~60 km/s between observations months apart) |
 | `ang_sep_arcsec` | Angular distance between the two candidates' positions |
 
-The pairs table can be viewed side by side in the CandyJar match viewer (`-m`, see https://github.com/wintervolcano/CandyJar).
+The pairs table can be viewed side by side in the CandyJar match viewer (https://github.com/wintervolcano/CandyJar). CandyJar includes this repository as a submodule and builds `csv_matcher_v2` itself, so `-m a.csv b.csv` there matches and opens the pairs in one step.

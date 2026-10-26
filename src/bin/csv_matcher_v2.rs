@@ -216,6 +216,8 @@ struct RowRef {
 
 struct FileData {
     path: PathBuf,
+    /// Absolute path of the input, written to the pairs table so plots can be found relative to it.
+    abs_path: String,
     header: StringRecord,
     rows: Vec<StringRecord>,
     hmap: HashMap<String, usize>,
@@ -242,6 +244,10 @@ fn read_csv(path: &Path) -> Result<FileData> {
 
     Ok(FileData {
         path: path.to_path_buf(),
+        abs_path: std::fs::canonicalize(path)
+            .unwrap_or_else(|_| path.to_path_buf())
+            .to_string_lossy()
+            .to_string(),
         header,
         rows,
         hmap,
@@ -529,6 +535,12 @@ fn main() -> Result<()> {
                 .help("Telescope east longitude in degrees (default: MeerKAT)."),
         )
         .arg(
+            Arg::new("pairs_only")
+                .long("pairs-only")
+                .action(ArgAction::SetTrue)
+                .help("Only write the pairs table, not a <input>_matched.csv next to every input."),
+        )
+        .arg(
             Arg::new("pairs_out")
                 .long("pairs-out")
                 .num_args(1)
@@ -585,6 +597,7 @@ fn main() -> Result<()> {
     let out_suffix = matches.get_one::<String>("out_suffix").unwrap();
     let pairs_out = matches.get_one::<String>("pairs_out").unwrap();
     let bary = matches.get_flag("bary");
+    let pairs_only = matches.get_flag("pairs_only");
     let site_lat: f64 = matches
         .get_one::<String>("site_lat")
         .unwrap()
@@ -809,7 +822,7 @@ fn main() -> Result<()> {
         }
     }
 
-    for (fid, f) in files.iter().enumerate() {
+    for (fid, f) in files.iter().enumerate().filter(|_| !pairs_only) {
         let out_path = out_path_for(&f.path, out_suffix);
 
         let mut w = WriterBuilder::new()
@@ -840,7 +853,7 @@ fn main() -> Result<()> {
             .with_context(|| format!("creating {}", pairs_out))?;
         let mut header_out: Vec<String> = vec!["match_group".to_string()];
         for side in ["a", "b"] {
-            for col in ["file", "row", "period", "period_demod", "dm", "acc", "snr", "tobs", "epoch_mjd", "ra", "dec"] {
+            for col in ["file", "path", "row", "period", "period_demod", "dm", "acc", "snr", "tobs", "epoch_mjd", "ra", "dec"] {
                 header_out.push(format!("{}_{}", col, side));
             }
             for col in &copied_cols {
@@ -867,6 +880,7 @@ fn main() -> Result<()> {
             let f = &files[rr.file_id];
             let mut v = vec![
                 f.path.file_name().unwrap().to_string_lossy().to_string(),
+                f.abs_path.clone(),
                 (rr.row_idx + 1).to_string(), // 1-based data row number in the ORIGINAL input file
                 format!("{}", rr.period.unwrap()),
                 fmt_opt(rr.period_bary),
